@@ -15,13 +15,15 @@ function typeKeyboard(){return {inline:true,buttons:[[{action:{type:"callback",l
 async function onMessage(m:any){
  const p=Number(m.peer_id),u=Number(m.from_id),text=String(m.text??"").trim();
  console.log(`[MESSAGE] peer=${p} user=${u} text=${JSON.stringify(text)} chat=${isChat(p)}`);
- if(!isChat(p))return; // LС полностью игнорируются.
- const c=command(text),open=["/sync","/delsync","/synclist"];
- if(!await S.isActive(p)&&!open.includes(c)){console.log(`[IGNORE] peer=${p} not active`);return}
+ if(!isChat(p))return;
+ const c=command(text);
+ // Эти команды разрешены до активации, потому что именно они запускают настройку беседы.
+ const setup=["/sync","/delsync","/synclist","/addgroup","/delgroup","/mygroups"];
+ if(!await S.isActive(p)&&!setup.includes(c)){console.log(`[IGNORE] peer=${p} not active`);return}
  if(!await S.getChatInfo(p))await S.setChatInfo(p,`Беседа ${p-2000000000}`,await owner(p));
  console.log(`[CMD] peer=${p} user=${u} command=${c} active=${await S.isActive(p)} sync=${await S.isSync(p)} type=${await S.getChatType(p)} dev=${DEV.has(u)}`);
  if(c==="/sync"){
-  if(!await can(p,u,"zsa"))return reply(p,m,"Недостаточно прав.");
+  if(!can(p,u,"zsa"))return reply(p,m,"Недостаточно прав.");
   await S.addSync(p);await S.setChatInfo(p,`Беседа ${p-2000000000}`,await owner(p));
   return reply(p,m,"Синхронизация с базой данных прошла успешно!");
  }
@@ -55,7 +57,6 @@ async function onMessage(m:any){
   if(!(await S.myGroups(u)).includes(p))return reply(p,m,"Сначала выполните /addgroup в этой беседе.");
   return reply(p,m,"Выберите тип беседы:",typeKeyboard());
  }
- // Остальные команды пока намеренно не запускаются: фундамент должен пройти проверку отдельно.
  return reply(p,m,"Бот подключён. Завершите настройку: /sync → /addgroup → /type");
 }
 
