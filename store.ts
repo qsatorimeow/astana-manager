@@ -2,20 +2,28 @@ import {redis} from "./kv.ts";
 
 export type ChatType="admin"|"players";
 export type Role="developer"|"sa"|"zsa"|"senadmin"|"admin"|"senmoder"|"moder"|"none";
-const ROOT="newbot:"; const r=(k:string)=>`${ROOT}${k}`; const chat=(p:number)=>r(`chat:${p}`);
+const ROOT="newbot:";
+const r=(k:string)=>`${ROOT}${k}`;
+const chat=(p:number)=>r(`chat:${p}`);
 const rank:Record<Role,number>={none:0,moder:1,senmoder:2,admin:3,senadmin:4,zsa:6,sa:7,developer:9};
 export function roleRank(x:Role){return rank[x]??0}
-export async function setChatType(peer:number,type:ChatType){await redis.set(chat(peer)+":type",type)}
+
+// Activation is intentionally strict: sync -> addgroup -> type.
+export async function setChatType(peer:number,type:ChatType){
+ if(!(await isSync(peer)))throw new Error("CHAT_NOT_SYNCED");
+ if(!(await isActive(peer)))throw new Error("CHAT_NOT_ADDED");
+ await redis.set(chat(peer)+":type",type);
+}
 export async function getChatType(peer:number):Promise<ChatType|null>{return await redis.get<ChatType>(chat(peer)+":type")}
 export async function hasChatType(peer:number){return (await getChatType(peer))!==null}
 export async function setChatInfo(peer:number,name:string,owner:number){await redis.hset(chat(peer)+":info",{name,owner:String(owner)})}
 export async function getChatInfo(peer:number){return await redis.hgetall<Record<string,string>>(chat(peer)+":info")}
 export async function addSync(peer:number){await redis.sadd(r("sync:chats"),String(peer));await redis.set(r(`sync:${peer}`),"1")}
-export async function delSync(peer:number){await redis.srem(r("sync:chats"),String(peer));await redis.del(r(`sync:${peer}`));await redis.del(chat(peer)+":active")}
+export async function delSync(peer:number){await redis.srem(r("sync:chats"),String(peer));await redis.del(r(`sync:${peer}`));await redis.del(chat(peer)+":type");await redis.del(chat(peer)+":active")}
 export async function isSync(peer:number){return (await redis.get(r(`sync:${peer}`)))==="1"}
 export async function syncChats(){return (await redis.smembers(r("sync:chats"))).map(Number)}
-export async function addMyGroup(user:number,peer:number){await redis.sadd(r(`mygroups:${user}`),String(peer));await redis.sadd(r("active:chats"),String(peer));await redis.set(chat(peer)+":active","1")}
-export async function delMyGroup(user:number,peer:number){await redis.srem(r(`mygroups:${user}`),String(peer));const keys=await redis.keys(r("mygroups:*")).then(async ks=>{for(const k of ks)if(await redis.sismember(k,String(peer)))return true;return false});if(!keys){await redis.srem(r("active:chats"),String(peer));await redis.del(chat(peer)+":active")}}
+export async function addMyGroup(user:number,peer:number){if(!(await isSync(peer)))throw new Error("CHAT_NOT_SYNCED");await redis.sadd(r(`mygroups:${user}`),String(peer));await redis.sadd(r("active:chats"),String(peer));await redis.set(chat(peer)+":active","1")}
+export async function delMyGroup(user:number,peer:number){await redis.srem(r(`mygroups:${user}`),String(peer));const owners=await redis.keys(r("mygroups:*")).then(async ks=>{for(const k of ks)if(await redis.sismember(k,String(peer)))return true;return false});if(!owners){await redis.srem(r("active:chats"),String(peer));await redis.del(chat(peer)+":active");await redis.del(chat(peer)+":type")}}
 export async function myGroups(user:number){return (await redis.smembers(r(`mygroups:${user}`))).map(Number)}
 export async function isActive(peer:number){return (await redis.get(chat(peer)+":active"))==="1"}
 export async function setRole(peer:number,user:number,role:Role){if(role==="none")await redis.del(chat(peer)+`:role:${user}`);else await redis.set(chat(peer)+`:role:${user}`,role)}
