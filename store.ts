@@ -3,6 +3,7 @@ export type Role="developer"|"sa"|"zsa"|"senadmin"|"admin"|"senmoder"|"moder"|"n
 const r=(k:string)=>`newbot:${k}`; const chat=(p:number)=>r(`chat:${p}`);
 export async function setChatType(peer:number,type:"admin"|"players"){await redis.set(chat(peer)+":type",type)}
 export async function getChatType(peer:number){return (await redis.get<string>(chat(peer)+":type"))??"admin"}
+export async function hasChatType(peer:number){return !!(await redis.get<string>(chat(peer)+":type"))}
 export async function setChatInfo(peer:number,name:string,owner:number){await redis.hset(chat(peer)+":info",{name,owner:String(owner)});await redis.sadd(r("known:chats"),String(peer))}
 export async function knownChats(){return (await redis.smembers(r("known:chats"))).map(Number)}
 export async function getChatInfo(peer:number){return await redis.hgetall<Record<string,string>>(chat(peer)+":info")}
