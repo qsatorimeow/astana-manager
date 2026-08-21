@@ -1,16 +1,29 @@
 const VK_TOKEN=Deno.env.get("VK_TOKEN")??"";
 const V="5.199";
 
-// VK Callback API sends message_new as { type:"message_new", object:<message> }.
-// main.ts expects body.object.message, so normalize message_new at the Request boundary.
+// VK Callback API: message_new has the message directly in object.
+// main.ts historically expects object.message, so normalize it here.
+// Also log the normalization so Deno logs show exactly what VK sent.
 const _json=Request.prototype.json;
-Request.prototype.json=async function(this:Request){
+const _patchedJson=async function(this:Request){
   const body:any=await _json.call(this);
-  if(body?.type==="message_new" && body.object && !body.object.message){
-    body.object={message:body.object};
+  console.log(`[VK] parsed callback type=${body?.type??"unknown"}`);
+  if(body?.type==="message_new" && body.object){
+    if(!body.object.message){
+      console.log("[VK] normalizing message_new: object -> object.message");
+      body.object={message:body.object};
+    }else{
+      console.log("[VK] message_new already contains object.message");
+    }
   }
   return body;
 };
+try{
+  Object.defineProperty(Request.prototype,"json",{value:_patchedJson,writable:true,configurable:true});
+}catch(e){
+  console.warn("[VK] Request.json defineProperty failed, using direct patch",e);
+  try{Request.prototype.json=_patchedJson as typeof Request.prototype.json}catch{}
+}
 
 export async function vk(method:string, params:Record<string,string|number|undefined>={}):Promise<any>{
  const p=new URLSearchParams(); for(const [k,v] of Object.entries(params)) if(v!==undefined)p.set(k,String(v)); p.set("access_token",VK_TOKEN);p.set("v",V);
