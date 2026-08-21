@@ -1,4 +1,17 @@
-const VK_TOKEN=Deno.env.get("VK_TOKEN")??""; const V="5.199";
+const VK_TOKEN=Deno.env.get("VK_TOKEN")??"";
+const V="5.199";
+
+// VK Callback API sends message_new as { type:"message_new", object:<message> }.
+// main.ts expects body.object.message, so normalize message_new at the Request boundary.
+const _json=Request.prototype.json;
+Request.prototype.json=async function(this:Request){
+  const body:any=await _json.call(this);
+  if(body?.type==="message_new" && body.object && !body.object.message){
+    body.object={message:body.object};
+  }
+  return body;
+};
+
 export async function vk(method:string, params:Record<string,string|number|undefined>={}):Promise<any>{
  const p=new URLSearchParams(); for(const [k,v] of Object.entries(params)) if(v!==undefined)p.set(k,String(v)); p.set("access_token",VK_TOKEN);p.set("v",V);
  const r=await fetch(`https://api.vk.com/method/${method}`,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:p}); const d=await r.json(); if(d.error) console.error(`[VK] ${method}`,d.error); return d;
