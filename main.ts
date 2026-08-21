@@ -58,7 +58,7 @@ async function handleEvent(body:any){
  try{
   console.log(`[EVENT] chat accepted peer=${p}`);
   await S.setChatInfo(p,`Беседа ${p-2000000000}`,await owner(p));
-  if(await S.getChatType(p)==="players")await S.addMessage(p,u);await S.touchMessage(p,u);
+  if(await S.getChatType(p)==="players"){await S.addMessage(p,u);await S.touchMessage(p,u)}
   const banned=await S.getBan(String(p),u),global=await S.getBan("global",u),mute=await S.getMute(p,u);
   if(global||banned){await kick(p,u);return}if(await S.isTimeout(p)&&!await can(p,u,"admin")){await deleteCmid(p,m.conversation_message_id);return}if(mute){await deleteCmid(p,m.conversation_message_id);return}
   if(t.startsWith("/"))await cmd(p,u,t,m);
@@ -67,7 +67,9 @@ async function handleEvent(body:any){
 
 Deno.serve(async req=>{
  if(req.method!=="POST")return new Response("Bot is running",{status:200});
- let b:any;try{b=await req.json()}catch(e){console.error("[WEBHOOK] invalid JSON",e);return new Response("bad",{status:400)}
+ let b:any;
+ try{b=await req.json()}
+ catch(e){console.error("[WEBHOOK] invalid JSON",e);return new Response("bad",{status:400})}
  console.log(`[WEBHOOK] type=${b?.type??"unknown"}`);
  if(b?.type==="confirmation")return new Response(Deno.env.get("VK_CONFIRMATION")??"",{status:200});
  const secret=Deno.env.get("VK_SECRET");if(secret&&b?.secret!==secret)return new Response("invalid secret",{status:403});
