@@ -41,7 +41,23 @@ async function cmd(peer:number,from:number,text:string,message:any){
   if(!await can(peer,from,"senadmin"))return send(peer,"Недостаточно прав.");const p=uid(a[0]??"")??peer;if(!isChat(p))return send(peer,"Укажите id беседы или используйте команду внутри беседы.");
   if(c==="/addgroup"){await S.addMyGroup(from,p);return send(peer,"Данная беседа добавлена в список ваших чатов")};await S.delMyGroup(from,p);return send(peer,"Данная беседа удалена из списка ваших чатов");
  }
- if(c==="/mygroups"){if(!await can(peer,from,"senadmin"))return send(peer,"Недостаточно прав.");const ps=await myGroupTargets(from);return send(peer,"Список ваших чатов:\n"+(ps.length?ps.map(p=>`${await chatName(p)} | ${p}`).join("\n"):"Отсутствуют"));}
+if(c==="/mygroups"){
+  if(!await can(peer,from,"senadmin"))return send(peer,"Недостаточно прав.");
+
+  const ps=await myGroupTargets(from);
+
+  if(!ps.length){
+    return send(peer,"Список ваших чатов:\nОтсутствуют");
+  }
+
+  const rows:string[]=[];
+
+  for(const p of ps){
+    rows.push(`${await chatName(p)} | ${p}`);
+  }
+
+  return send(peer,"Список ваших чатов:\n"+rows.join("\n"));
+}
  if(c==="/type"){if(!await can(peer,from,"senadmin"))return send(peer,"Недостаточно прав.");return send(peer,"Выберите тип беседы:",keyboardType())}
  if(c==="/staff"){
   if(!await can(peer,from,"moder"))return send(peer,"Недостаточно прав.");const m=await getMembers(peer), ids=m.map((x:any)=>x.member_id), inf=await users(ids);const groups:Record<string,number[]>={owner:[],sa:[],zsa:[],senadmin:[],admin:[],senmoder:[],moder:[]};for(const id of ids){const r=await role(peer,id);if(groups[r as string])groups[r as string].push(id)}
