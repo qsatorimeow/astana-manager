@@ -5,12 +5,15 @@ import { getOwnerGroups } from "./setup.ts";
 
 export type BanEventType = "ban" | "unban" | "sban" | "sunban" | "gban" | "gunban" | "kick" | "skick" | "gkick";
 
-export interface BanHistoryEntry {
-  type: BanEventType;
-  peerId?: number;
+export interface BanRecord {
   reason: string;
   byUserId: number;
   at: number;
+}
+
+export interface BanHistoryEntry extends BanRecord {
+  type: BanEventType;
+  peerId?: number;
 }
 
 function historyKey(userId: number): string {
@@ -32,18 +35,16 @@ function chatBanKey(peerId: number, userId: number): string {
   return `b2:ban:${peerId}:${userId}`;
 }
 
-export async function setChatBan(peerId: number, userId: number, reason: string): Promise<void> {
-  await redis.set(chatBanKey(peerId, userId), reason);
-  await redis.sadd(`b2:ban_index:${peerId}`, String(userId));
+export async function setChatBan(peerId: number, userId: number, record: BanRecord): Promise<void> {
+  await redis.set(chatBanKey(peerId, userId), record);
 }
 
 export async function clearChatBan(peerId: number, userId: number): Promise<void> {
   await redis.del(chatBanKey(peerId, userId));
-  await redis.srem(`b2:ban_index:${peerId}`, String(userId));
 }
 
-export async function getChatBan(peerId: number, userId: number): Promise<string | null> {
-  return (await redis.get<string>(chatBanKey(peerId, userId))) ?? null;
+export async function getChatBan(peerId: number, userId: number): Promise<BanRecord | null> {
+  return (await redis.get<BanRecord>(chatBanKey(peerId, userId))) ?? null;
 }
 
 // --- Бан во всех беседах старшего администратора (/sban, /sunban) ---
@@ -52,8 +53,8 @@ function seniorBanKey(ownerId: number, userId: number): string {
   return `b2:sban:${ownerId}:${userId}`;
 }
 
-export async function setSeniorBan(ownerId: number, userId: number, reason: string): Promise<void> {
-  await redis.set(seniorBanKey(ownerId, userId), reason);
+export async function setSeniorBan(ownerId: number, userId: number, record: BanRecord): Promise<void> {
+  await redis.set(seniorBanKey(ownerId, userId), record);
   await redis.sadd(`b2:sban_owners:${userId}`, String(ownerId));
 }
 
@@ -62,22 +63,25 @@ export async function clearSeniorBan(ownerId: number, userId: number): Promise<v
   await redis.srem(`b2:sban_owners:${userId}`, String(ownerId));
 }
 
-export async function getSeniorBan(ownerId: number, userId: number): Promise<string | null> {
-  return (await redis.get<string>(seniorBanKey(ownerId, userId))) ?? null;
+export async function getSeniorBan(ownerId: number, userId: number): Promise<BanRecord | null> {
+  return (await redis.get<BanRecord>(seniorBanKey(ownerId, userId))) ?? null;
 }
 
-export async function getAllSeniorBans(userId: number): Promise<{ ownerId: number; reason: string }[]> {
+export async function getAllSeniorBans(userId: number): Promise<{ ownerId: number; record: BanRecord }[]> {
   const ownerIds = await redis.smembers(`b2:sban_owners:${userId}`);
-  const result: { ownerId: number; reason: string }[] = [];
+  const result: { ownerId: number; record: BanRecord }[] = [];
   for (const ownerIdStr of ownerIds ?? []) {
-    const reason = await getSeniorBan(Number(ownerIdStr), userId);
-    if (reason) result.push({ ownerId: Number(ownerIdStr), reason });
+    const record = await getSeniorBan(Number(ownerIdStr), userId);
+    if (record) result.push({ ownerId: Number(ownerIdStr), record });
   }
   return result;
 }
 
-/** Забанен ли пользователь через /sban у владельца peer_id-беседы (если она в его /mygroups). */
-export async function isSeniorBannedInChat(peerId: number, userId: number): Promise<{ ownerId: number; reason: string } | null> {
+/** Забанен ли пользователь через /sban у старшего администратора, чья беседа — peerId. */
+export async function isSeniorBannedInChat(
+  peerId: number,
+  userId: number,
+): Promise<{ ownerId: number; record: BanRecord } | null> {
   const bans = await getAllSeniorBans(userId);
   for (const ban of bans) {
     const groups = await getOwnerGroups(ban.ownerId);
@@ -92,16 +96,26 @@ function globalBanKey(userId: number): string {
   return `b2:gban:${userId}`;
 }
 
-export async function setGlobalBan(userId: number, reason: string): Promise<void> {
-  await redis.set(globalBanKey(userId), reason);
+export async function setGlobalBan(userId: number, record: BanRecord): Promise<void> {
+  await redis.set(globalBanKey(userId), record);
 }
 
 export async function clearGlobalBan(userId: number): Promise<void> {
   await redis.del(globalBanKey(userId));
 }
 
-export async function getGlobalBan(userId: number): Promise<string | null> {
-  return (await redis.get<string>(globalBanKey(userId))) ?? null;
+export async function getGlobalBan(userId: number): Promise<BanRecord | null> {
+  return (await redis.get<BanRecord>(globalBanKey(userId))) ?? null;
+}
+
+/** Есть ли у пользователя любая активная блокировка, действующая в этом чате. */
+export async function getActiveBanForChat(peerId: number, userId: number): Promise<BanRecord | null> {
+  const globalBan = await getGlobalBan(userId);
+  if (globalBan) return globalBan;
+  const chatBan = await getChatBan(peerId, userId);
+  if (chatBan) return chatBan;
+  const seniorBan = await isSeniorBannedInChat(peerId, userId);
+  return seniorBan ? seniorBan.record : null;
 }
 
 // --- Массовые кики (/skick, /gkick) ---
