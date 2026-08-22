@@ -1,5 +1,5 @@
 // /staff — полный список рангов беседы. /help и /alt — справка по командам.
-import { getConversationMembers, getUsersInfo, mention } from "./vk.ts";
+import { getConversationMembers, getUsersInfo, profileLink } from "./vk.ts";
 import {
   type AnyRole,
   CHAT_ROLES,
@@ -25,17 +25,21 @@ export async function buildStaffMessage(peerId: number): Promise<string> {
     ...chatRoleMembers.flat(),
   ];
   const infoMap = await getUsersInfo(allIds);
+  const nameOf = (id: number) => {
+    const info = infoMap.get(id);
+    return profileLink(id, info ? `${info.first_name} ${info.last_name}` : `id${id}`);
+  };
 
   const lines: string[] = [];
-  lines.push(`Владелец беседы — ${owner ? mention(owner.memberId, infoMap.get(owner.memberId)) : "Отсутствуют"}`);
+  lines.push(`Владелец беседы — ${owner ? nameOf(owner.memberId) : "Отсутствуют"}`);
   lines.push("");
 
   lines.push("Спец администраторы:");
-  lines.push(specAdmins.length ? specAdmins.map((id) => mention(id, infoMap.get(id))).join("\n") : "Отсутствуют");
+  lines.push(specAdmins.length ? specAdmins.map((id) => nameOf(id)).join("\n") : "Отсутствуют");
   lines.push("");
 
   lines.push("Зам.Спец администратора:");
-  lines.push(deputyAdmins.length ? deputyAdmins.map((id) => mention(id, infoMap.get(id))).join("\n") : "Отсутствуют");
+  lines.push(deputyAdmins.length ? deputyAdmins.map((id) => nameOf(id)).join("\n") : "Отсутствуют");
   lines.push("");
 
   const sectionLabels: Record<string, string> = {
@@ -48,7 +52,7 @@ export async function buildStaffMessage(peerId: number): Promise<string> {
   CHAT_ROLES.forEach((role, i) => {
     const ids = chatRoleMembers[i];
     lines.push(`${sectionLabels[role]}:`);
-    lines.push(ids.length ? ids.map((id) => mention(id, infoMap.get(id))).join("\n") : "Отсутствуют");
+    lines.push(ids.length ? ids.map((id) => nameOf(id)).join("\n") : "Отсутствуют");
     lines.push("");
   });
 
@@ -122,7 +126,7 @@ export const COMMAND_REGISTRY: CommandInfo[] = [
 
 export function buildHelpMessage(userWeight: number): string {
   const available = COMMAND_REGISTRY.filter((c) => userWeight >= ROLE_WEIGHT[c.minRole]);
-  const lines = ["📖 Доступные вам команды:"];
+  const lines = ["Доступные вам команды:"];
   for (const c of available) {
     lines.push(`${c.cmd} — ${c.description}`);
   }
