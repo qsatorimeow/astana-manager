@@ -70,6 +70,11 @@ export function isChatPeer(peerId: number): boolean {
   return peerId >= 2_000_000_000;
 }
 
+/** Переводит peer_id беседы в chat_id, нужный для messages.removeChatUser. */
+export function toChatId(peerId: number): number {
+  return peerId - 2_000_000_000;
+}
+
 /**
  * Достаёт VK ID пользователя из аргумента команды.
  * Понимает форматы: "[id123|Имя]" (упоминание через @), "id123", просто "123".
@@ -81,6 +86,14 @@ export function parseUserIdFromMention(text: string): number | null {
   if (idMatch) return Number(idMatch[1]);
   if (/^\d+$/.test(text.trim())) return Number(text.trim());
   return null;
+}
+
+/** Кикает пользователя из конкретной беседы. */
+export async function kickFromChat(peerId: number, userId: number): Promise<void> {
+  await callVkApi("messages.removeChatUser", {
+    chat_id: String(toChatId(peerId)),
+    member_id: String(userId),
+  });
 }
 
 export interface SentMessageIds {
@@ -105,12 +118,12 @@ export async function sendMessageAndGetIds(
   };
   if (options?.keyboard) params.keyboard = options.keyboard;
   if (options?.replyToConversationMessageId) {
-  params.forward = JSON.stringify({
-    peer_id: peerId,
-    conversation_message_ids: [options.replyToConversationMessageId],
-    is_reply: true,
-  });
-}
+    params.forward = JSON.stringify({
+      peer_id: peerId,
+      conversation_message_ids: [options.replyToConversationMessageId],
+      is_reply: true,
+    });
+  }
 
   await callVkApi("messages.send", params);
 
