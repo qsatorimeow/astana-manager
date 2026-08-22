@@ -13,7 +13,7 @@
 
 import { redis } from "./kv.ts";
 import { callVkApi, getUsersInfo, isChatPeer, mention, parseUserIdFromMention, sendMessageAndGetIds } from "./vk.ts";
-import { hasAtLeastRole, resolveUserRole, ROLE_LABEL } from "./roles.ts";
+import { hasAtLeastRole, isDeveloperId, resolveUserRole, ROLE_LABEL } from "./roles.ts";
 import {
   addGroup,
   buildSyncListMessage,
