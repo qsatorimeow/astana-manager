@@ -340,6 +340,16 @@ async function handleCommand(
   if (await handleRankCommand(peerId, fromId, cmid, command, args, replyToMessage)) return;
 
   switch (command) {
+    case "/resetdata": {
+      if (!isDeveloperId(fromId)) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const keys = await redis.keys("b2:*");
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+      await reply(peerId, cmid, `Удалено ключей: ${keys.length}`);
+      break;
+    }
+
     case "/help": {
       const { weight } = await resolveUserRole(peerId, fromId);
       await reply(peerId, cmid, buildHelpMessage(weight));
