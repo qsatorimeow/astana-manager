@@ -41,10 +41,17 @@ export async function getUsersInfo(userIds: number[]): Promise<Map<number, VkUse
   return map;
 }
 
-/** Кликабельное упоминание пользователя в тексте сообщения VK. */
-export function mention(userId: number, info?: VkUserInfo): string {
+/** Ссылка на профиль в формате "[Имя Фамилия](https://vk.ru/id123)". */
+export function profileLink(userId: number, name: string): string {
+  return `[${name}](https://vk.ru/id${userId})`;
+}
+
+/** Готовая ссылка-упоминание пользователя по его id (одиночный запрос имени). */
+export async function nameLinkOf(userId: number): Promise<string> {
+  const infoMap = await getUsersInfo([userId]);
+  const info = infoMap.get(userId);
   const name = info ? `${info.first_name} ${info.last_name}` : `id${userId}`;
-  return `[id${userId}|${name}]`;
+  return profileLink(userId, name);
 }
 
 export interface ConversationMember {
@@ -75,25 +82,43 @@ export function toChatId(peerId: number): number {
   return peerId - 2_000_000_000;
 }
 
-/**
- * Достаёт VK ID пользователя из аргумента команды.
- * Понимает форматы: "[id123|Имя]" (упоминание через @), "id123", просто "123".
- */
-export function parseUserIdFromMention(text: string): number | null {
-  const bracketMatch = text.match(/\[id(\d+)\|/);
-  if (bracketMatch) return Number(bracketMatch[1]);
-  const idMatch = text.match(/id(\d+)/);
-  if (idMatch) return Number(idMatch[1]);
-  if (/^\d+$/.test(text.trim())) return Number(text.trim());
-  return null;
-}
-
 /** Кикает пользователя из конкретной беседы. */
 export async function kickFromChat(peerId: number, userId: number): Promise<void> {
   await callVkApi("messages.removeChatUser", {
     chat_id: String(toChatId(peerId)),
     member_id: String(userId),
   });
+}
+
+/** Резолвит короткое имя (screen_name) VK в числовой ID, если это пользователь. */
+export async function resolveScreenName(screenName: string): Promise<number | null> {
+  const data = await callVkApi("utils.resolveScreenName", { screen_name: screenName });
+  if (data?.response?.type === "user") return Number(data.response.object_id);
+  return null;
+}
+
+/**
+ * Достаёт VK ID пользователя из аргумента команды. Понимает:
+ * упоминание "[id123|Имя]", "@screenname", "screenname", "id123", "123",
+ * ссылку вида "https://vk.com/screenname" или "https://vk.ru/id123".
+ */
+export async function resolveTargetUserId(raw: string): Promise<number | null> {
+  let text = raw.trim();
+  if (!text) return null;
+
+  const bracketMatch = text.match(/\[id(\d+)\|/);
+  if (bracketMatch) return Number(bracketMatch[1]);
+
+  text = text.replace(/^https?:\/\/(www\.)?(vk\.com|vk\.ru)\//i, "");
+  text = text.replace(/^@/, "");
+  text = text.trim();
+
+  const idMatch = text.match(/^id(\d+)$/i);
+  if (idMatch) return Number(idMatch[1]);
+  if (/^\d+$/.test(text)) return Number(text);
+
+  if (text) return await resolveScreenName(text);
+  return null;
 }
 
 export interface SentMessageIds {
