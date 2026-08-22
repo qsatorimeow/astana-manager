@@ -163,4 +163,5 @@ export const ALT_MAP: Record<string, string> = {
   "заткнуть": "/mute",
   "размут": "/unmute",
   "разоткнуть": "/unmute",
+  "тишина": "/timeout",
 };
