@@ -105,8 +105,12 @@ export async function sendMessageAndGetIds(
   };
   if (options?.keyboard) params.keyboard = options.keyboard;
   if (options?.replyToConversationMessageId) {
-    params.reply_to = String(options.replyToConversationMessageId);
-  }
+  params.forward = JSON.stringify({
+    peer_id: peerId,
+    conversation_message_ids: [options.replyToConversationMessageId],
+    is_reply: true,
+  });
+}
 
   await callVkApi("messages.send", params);
 
