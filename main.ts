@@ -5,19 +5,23 @@
 //   DEVELOPER_IDS — VK ID разработчика(ов) через запятую; разработчик обходит все проверки
 //
 // Бот работает ТОЛЬКО в беседах (не в ЛС). Пока для беседы не пройдены
-// /sync → /addgroup → /type, любые команды кроме этих трёх и /help не работают
+// /sync → /addgroup → /type, любые команды кроме этих трёх не работают
 // (кроме разработчика — он может использовать что угодно и где угодно).
+// Символы вызова команды: / + !
+//
+// Цель команды можно указать: упоминанием, "@screenname", "screenname",
+// "id123", просто "123", ссылкой на профиль, или вообще не указывать —
+// тогда берётся автор сообщения, на которое сделан ответ (reply).
 //
 // Каждый ответ бота отправляется реплаем на сообщение, вызвавшее команду.
 
 import { redis } from "./kv.ts";
 import {
   callVkApi,
-  getUsersInfo,
   isChatPeer,
   kickFromChat,
-  mention,
-  parseUserIdFromMention,
+  nameLinkOf,
+  resolveTargetUserId,
   sendMessageAndGetIds,
 } from "./vk.ts";
 import {
@@ -41,6 +45,7 @@ import {
   getConfigStatusMessage,
   getOwnerGroups,
   isChatConfigured,
+  isSynced,
   removeGroup,
   setChatType,
   setSync,
@@ -56,16 +61,17 @@ import {
   tryClaimReward,
 } from "./economy.ts";
 import {
+  type BanRecord,
   clearChatBan,
   clearGlobalBan,
   clearMute,
   clearSeniorBan,
+  getActiveBanForChat,
   getAllSeniorBans,
   getBanHistory,
   getChatBan,
   getGlobalBan,
   isMuted,
-  isSeniorBannedInChat,
   isTimeoutActive,
   kickFromAllSyncedChats,
   kickFromOwnerGroups,
@@ -82,6 +88,8 @@ import { ALT_MAP, buildHelpMessage, buildStaffMessage } from "./staff.ts";
 
 const VK_CONFIRMATION = Deno.env.get("VK_CONFIRMATION") ?? "";
 const VK_SECRET = Deno.env.get("VK_SECRET") ?? "";
+const NO_PERMISSION = "Недостаточно прав!";
+const NO_TARGET = "Вы не указали пользователя";
 
 async function alreadyProcessed(eventId: string | undefined): Promise<boolean> {
   if (!eventId) return false;
@@ -103,9 +111,41 @@ function formatMsk(ms: number): string {
     `${pad(mskDate.getUTCHours())}:${pad(mskDate.getUTCMinutes())}:${pad(mskDate.getUTCSeconds())} МСК (UTC+3)`;
 }
 
-async function nameOf(userId: number): Promise<string> {
-  const infoMap = await getUsersInfo([userId]);
-  return mention(userId, infoMap.get(userId));
+interface ReplyContext {
+  fromId: number;
+  conversationMessageId: number;
+}
+
+/**
+ * Определяет цель команды: сначала пробует явный аргумент (упоминание/ник/ссылка/id),
+ * если не получилось — берёт автора сообщения, на которое дан ответ.
+ * Возвращает найденный id и оставшиеся аргументы (без потраченного на цель).
+ */
+async function extractTarget(
+  args: string[],
+  replyToMessage: ReplyContext | null,
+): Promise<{ targetId: number | null; rest: string[] }> {
+  if (args.length > 0) {
+    const resolved = await resolveTargetUserId(args[0]);
+    if (resolved) return { targetId: resolved, rest: args.slice(1) };
+  }
+  if (replyToMessage) return { targetId: replyToMessage.fromId, rest: args };
+  return { targetId: null, rest: args };
+}
+
+/** Может ли actor воздействовать на target (разработчик — всегда; иначе ранг строго выше). */
+async function canActOn(peerId: number, actorId: number, targetId: number): Promise<boolean> {
+  if (isDeveloperId(actorId)) return true;
+  if (actorId === targetId) return true;
+  const [actor, target] = await Promise.all([
+    resolveUserRole(peerId, actorId),
+    resolveUserRole(peerId, targetId),
+  ]);
+  return actor.weight > target.weight;
+}
+
+function formatBanEntry(record: BanRecord, byName: string): string {
+  return `${byName} | ${record.reason} | ${formatMsk(record.at)}`;
 }
 
 // --- Команды настройки (работают даже до полной конфигурации чата) ---
@@ -120,27 +160,31 @@ async function handleSetupCommand(
   switch (command) {
     case "/sync": {
       if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
-        await reply(peerId, cmid, "Команда доступна спец. и зам. спец. администратору.");
+        await reply(peerId, cmid, NO_PERMISSION);
+        return true;
+      }
+      if (await isSynced(peerId)) {
+        await reply(peerId, cmid, "Эта беседа уже синхронизирована.");
         return true;
       }
       await setSync(peerId, fromId);
-      await reply(peerId, cmid, "✅ Синхронизация с базой данных прошла успешно!");
+      await reply(peerId, cmid, "Синхронизация с базой данных прошла успешно!");
       return true;
     }
 
     case "/delsync": {
       if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
-        await reply(peerId, cmid, "Команда доступна спец. и зам. спец. администратору.");
+        await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
       await clearSync(peerId);
-      await reply(peerId, cmid, "🗑 Синхронизация с базой данных удалена.");
+      await reply(peerId, cmid, "Синхронизация с базой данных удалена.");
       return true;
     }
 
     case "/synclist": {
       if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
-        await reply(peerId, cmid, "Команда доступна спец. и зам. спец. администратору.");
+        await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
       await reply(peerId, cmid, await buildSyncListMessage());
@@ -149,29 +193,29 @@ async function handleSetupCommand(
 
     case "/addgroup": {
       if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
-        await reply(peerId, cmid, "Команда доступна старшему администратору.");
+        await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
       const targetPeer = args[0] ? Number(args[0]) : peerId;
       await addGroup(targetPeer, fromId);
-      await reply(peerId, cmid, "✅ Данная беседа добавлена в список ваших чатов.");
+      await reply(peerId, cmid, "Данная беседа добавлена в список ваших чатов.");
       return true;
     }
 
     case "/delgroup": {
       if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
-        await reply(peerId, cmid, "Команда доступна старшему администратору.");
+        await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
       const targetPeer = args[0] ? Number(args[0]) : peerId;
       await removeGroup(targetPeer, fromId);
-      await reply(peerId, cmid, "🗑 Данная беседа удалена из списка ваших чатов.");
+      await reply(peerId, cmid, "Данная беседа удалена из списка ваших чатов.");
       return true;
     }
 
     case "/mygroups": {
       if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
-        await reply(peerId, cmid, "Команда доступна старшему администратору.");
+        await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
       const groups = await getOwnerGroups(fromId);
@@ -184,7 +228,7 @@ async function handleSetupCommand(
 
     case "/type": {
       if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
-        await reply(peerId, cmid, "Команда доступна старшему администратору.");
+        await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
       const keyboard = JSON.stringify({
@@ -244,18 +288,30 @@ const RANK_COMMANDS: Record<string, RankCommandConfig> = {
   "/delmoder": { requiredRole: "senior_moderator", action: "remove", role: "moderator", scope: "chat" },
 };
 
-async function handleRankCommand(peerId: number, fromId: number, cmid: number, command: string, args: string[]): Promise<boolean> {
+async function handleRankCommand(
+  peerId: number,
+  fromId: number,
+  cmid: number,
+  command: string,
+  args: string[],
+  replyToMessage: ReplyContext | null,
+): Promise<boolean> {
   const cfg = RANK_COMMANDS[command];
   if (!cfg) return false;
 
   if (!(await hasAtLeastRole(peerId, fromId, cfg.requiredRole))) {
-    await reply(peerId, cmid, "Недостаточно прав для этой команды.");
+    await reply(peerId, cmid, NO_PERMISSION);
     return true;
   }
 
-  const targetId = parseUserIdFromMention(args.join(" "));
+  const { targetId } = await extractTarget(args, replyToMessage);
   if (!targetId) {
-    await reply(peerId, cmid, `Формат: ${command} @пользователь`);
+    await reply(peerId, cmid, NO_TARGET);
+    return true;
+  }
+
+  if (!(await canActOn(peerId, fromId, targetId))) {
+    await reply(peerId, cmid, NO_PERMISSION);
     return true;
   }
 
@@ -267,16 +323,11 @@ async function handleRankCommand(peerId: number, fromId: number, cmid: number, c
     else await removeChatRole(peerId, cfg.role as ChatRole, targetId);
   }
 
-  await reply(peerId, cmid, cfg.action === "add" ? "✅ Ранг назначен." : "➖ Ранг снят.");
+  await reply(peerId, cmid, cfg.action === "add" ? "Ранг назначен." : "Ранг снят.");
   return true;
 }
 
 // --- Остальные команды (требуют полной настройки чата) ---
-
-interface ReplyContext {
-  fromId: number;
-  conversationMessageId: number;
-}
 
 async function handleCommand(
   peerId: number,
@@ -286,8 +337,7 @@ async function handleCommand(
   args: string[],
   replyToMessage: ReplyContext | null,
 ) {
-  // Назначение/снятие рангов — общая таблица
-  if (await handleRankCommand(peerId, fromId, cmid, command, args)) return;
+  if (await handleRankCommand(peerId, fromId, cmid, command, args, replyToMessage)) return;
 
   switch (command) {
     case "/help": {
@@ -320,7 +370,7 @@ async function handleCommand(
 
     case "/staff": {
       if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
+        await reply(peerId, cmid, NO_PERMISSION);
         return;
       }
       await reply(peerId, cmid, await buildStaffMessage(peerId));
@@ -332,28 +382,30 @@ async function handleCommand(
     case "/reward": {
       const result = await tryClaimReward(fromId);
       if (result.ok) {
-        await reply(peerId, cmid, `🪙 Вы получили ${result.amount} монет!`);
+        await reply(peerId, cmid, `Вы получили ${result.amount} монет!`);
       } else {
         const minutesLeft = Math.ceil(result.msLeft / 60000);
-        await reply(peerId, cmid, `⏳ Следующая награда будет доступна через ${minutesLeft} мин.`);
+        await reply(peerId, cmid, `Следующая награда будет доступна через ${minutesLeft} мин.`);
       }
       break;
     }
 
     case "/balance": {
       const balance = await getBalance(fromId);
-      await reply(peerId, cmid, `💰 Ваш баланс: ${balance} монет.`);
+      await reply(peerId, cmid, `Ваш баланс: ${balance} монет.`);
       break;
     }
 
     case "/stats": {
-      const [role, stats] = await Promise.all([
-        resolveUserRole(peerId, fromId),
-        getMessageStats(peerId, fromId),
+      const { targetId } = await extractTarget(args, replyToMessage);
+      const statsUserId = targetId ?? fromId;
+      const [role, stats, balance, nick, name] = await Promise.all([
+        resolveUserRole(peerId, statsUserId),
+        getMessageStats(peerId, statsUserId),
+        getBalance(statsUserId),
+        getNickFor(peerId, statsUserId),
+        nameLinkOf(statsUserId),
       ]);
-      const balance = await getBalance(fromId);
-      const nick = await getNickFor(peerId, fromId);
-      const name = await nameOf(fromId);
       const lines = [
         `Информация о пользователе ${name}`,
         `Роль: ${ROLE_LABEL[role.role]}`,
@@ -367,255 +419,225 @@ async function handleCommand(
     }
 
     case "/pay": {
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const amount = Number(args[1]);
-      if (!targetId || !amount || amount <= 0) {
-        await reply(peerId, cmid, "Формат: /pay @пользователь количество");
-        return;
-      }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      const amount = Number(rest[0]);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!amount || amount <= 0) { await reply(peerId, cmid, "Укажите количество монет."); return; }
       const ok = await transferBalance(fromId, targetId, amount);
-      await reply(peerId, cmid, ok ? `✅ Вы передали ${amount} монет.` : "⚠️ Недостаточно монет на балансе.");
+      await reply(peerId, cmid, ok ? `Вы передали ${amount} монет.` : "Недостаточно монет на балансе.");
       break;
     }
 
     case "/top": {
       const entries = await getChatTop(peerId);
-      await reply(peerId, cmid, `🏆 Топ по балансу в чате:\n${await formatTopList(entries)}`);
+      await reply(peerId, cmid, `Топ по балансу в чате:\n${await formatTopList(entries)}`);
       break;
     }
 
     case "/gtop": {
       const entries = await getGlobalTop();
-      await reply(peerId, cmid, `🏆 Топ по балансу среди всех пользователей:\n${await formatTopList(entries)}`);
+      await reply(peerId, cmid, `Топ по балансу среди всех пользователей:\n${await formatTopList(entries)}`);
       break;
     }
 
     // --- Баны и кики ---
 
     case "/ban": {
-      if (!(await hasAtLeastRole(peerId, fromId, "senior_moderator"))) {
-        await reply(peerId, cmid, "Команда доступна старшему модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /ban @пользователь причина"); return; }
-      await setChatBan(peerId, targetId, reason);
-      await logBanEvent(targetId, { type: "ban", peerId, reason, byUserId: fromId, at: Date.now() });
+      if (!(await hasAtLeastRole(peerId, fromId, "senior_moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const reason = rest.join(" ") || "Не указана";
+      const record: BanRecord = { reason, byUserId: fromId, at: Date.now() };
+      await setChatBan(peerId, targetId, record);
+      await logBanEvent(targetId, { type: "ban", peerId, ...record });
       await kickFromChat(peerId, targetId);
-      await reply(peerId, cmid, `🚫 ${await nameOf(targetId)} забанен и кикнут из беседы. Причина: ${reason}`);
+      await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из этой беседы пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
 
     case "/unban": {
-      if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
-        await reply(peerId, cmid, "Команда доступна старшему администратору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /unban @пользователь причина"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      const reason = rest.join(" ") || "Не указана";
       await clearChatBan(peerId, targetId);
       await logBanEvent(targetId, { type: "unban", peerId, reason, byUserId: fromId, at: Date.now() });
-      await reply(peerId, cmid, `✅ Бан снят с ${await nameOf(targetId)}. Причина: ${reason}`);
+      await reply(peerId, cmid, `Бан снят с ${await nameLinkOf(targetId)}. Причина: ${reason}`);
       break;
     }
 
     case "/sban": {
-      if (!(await hasAtLeastRole(peerId, fromId, "admin"))) {
-        await reply(peerId, cmid, "Команда доступна администратору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /sban @пользователь причина"); return; }
-      await setSeniorBan(fromId, targetId, reason);
-      await logBanEvent(targetId, { type: "sban", reason, byUserId: fromId, at: Date.now() });
-      const count = await kickFromOwnerGroups(fromId, targetId);
-      await reply(peerId, cmid, `🚫 ${await nameOf(targetId)} забанен во всех ваших беседах (${count}). Причина: ${reason}`);
+      if (!(await hasAtLeastRole(peerId, fromId, "admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const reason = rest.join(" ") || "Не указана";
+      const record: BanRecord = { reason, byUserId: fromId, at: Date.now() };
+      await setSeniorBan(fromId, targetId, record);
+      await logBanEvent(targetId, { type: "sban", ...record });
+      await kickFromOwnerGroups(fromId, targetId);
+      await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из ваших бесед пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
 
     case "/sunban": {
-      if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
-        await reply(peerId, cmid, "Команда доступна старшему администратору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /sunban @пользователь причина"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      const reason = rest.join(" ") || "Не указана";
       await clearSeniorBan(fromId, targetId);
       await logBanEvent(targetId, { type: "sunban", reason, byUserId: fromId, at: Date.now() });
-      await reply(peerId, cmid, `✅ Бан во всех ваших беседах снят с ${await nameOf(targetId)}. Причина: ${reason}`);
+      await reply(peerId, cmid, `Бан во всех ваших беседах снят с ${await nameLinkOf(targetId)}. Причина: ${reason}`);
       break;
     }
 
     case "/gban": {
-      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
-        await reply(peerId, cmid, "Команда доступна спец. и зам. спец. администратору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /gban @пользователь причина"); return; }
-      await setGlobalBan(targetId, reason);
-      await logBanEvent(targetId, { type: "gban", reason, byUserId: fromId, at: Date.now() });
-      const count = await kickFromAllSyncedChats(targetId);
-      await reply(peerId, cmid, `🚫 ${await nameOf(targetId)} забанен глобально (${count} чатов). Причина: ${reason}`);
+      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const reason = rest.join(" ") || "Не указана";
+      const record: BanRecord = { reason, byUserId: fromId, at: Date.now() };
+      await setGlobalBan(targetId, record);
+      await logBanEvent(targetId, { type: "gban", ...record });
+      await kickFromAllSyncedChats(targetId);
+      await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из всех бесед бота пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
 
     case "/gunban": {
-      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
-        await reply(peerId, cmid, "Команда доступна спец. и зам. спец. администратору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /gunban @пользователь причина"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      const reason = rest.join(" ") || "Не указана";
       await clearGlobalBan(targetId);
       await logBanEvent(targetId, { type: "gunban", reason, byUserId: fromId, at: Date.now() });
-      await reply(peerId, cmid, `✅ Глобальный бан снят с ${await nameOf(targetId)}. Причина: ${reason}`);
+      await reply(peerId, cmid, `Глобальный бан снят с ${await nameLinkOf(targetId)}. Причина: ${reason}`);
       break;
     }
 
     case "/getban": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "") ?? fromId;
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId } = await extractTarget(args, replyToMessage);
+      const userId = targetId ?? fromId;
+
       const [globalBan, seniorBans, chatBan] = await Promise.all([
-        getGlobalBan(targetId),
-        getAllSeniorBans(targetId),
-        getChatBan(peerId, targetId),
+        getGlobalBan(userId),
+        getAllSeniorBans(userId),
+        getChatBan(peerId, userId),
       ]);
-      const lines = [`Информация о блокировках пользователя ${await nameOf(targetId)}`, ""];
-      lines.push(`Глобальная блокировка (/gban) — ${globalBan ? `есть, причина: ${globalBan}` : "отсутствует"}`);
-      lines.push(
-        seniorBans.length
-          ? `Блокировки от старших администраторов (/sban) — ${seniorBans.length} шт.`
-          : "Блокировки от старших администраторов (/sban) — отсутствуют",
-      );
-      lines.push(`Блокировка в этой беседе (/ban) — ${chatBan ? `есть, причина: ${chatBan}` : "отсутствует"}`);
+
+      const lines = [`Информация о блокировках пользователя ${await nameLinkOf(userId)}`, ""];
+
+      lines.push(`Глобальная блокировка — ${globalBan ? "Да" : "Нет"}`);
+      if (globalBan) lines.push(`1) ${formatBanEntry(globalBan, await nameLinkOf(globalBan.byUserId))}`);
+      lines.push("");
+
+      lines.push(`Блокировки в ваших беседах — ${seniorBans.length ? "" : "отсутствуют"}`);
+      for (let i = 0; i < seniorBans.length; i++) {
+        lines.push(`${i + 1}) ${formatBanEntry(seniorBans[i].record, await nameLinkOf(seniorBans[i].record.byUserId))}`);
+      }
+      lines.push("");
+
+      lines.push(`Блокировка в этой беседе — ${chatBan ? "" : "отсутствует"}`);
+      if (chatBan) lines.push(`1) ${formatBanEntry(chatBan, await nameLinkOf(chatBan.byUserId))}`);
+
       await reply(peerId, cmid, lines.join("\n"));
       break;
     }
 
     case "/banlist": {
-      if (!(await hasAtLeastRole(peerId, fromId, "senior_moderator"))) {
-        await reply(peerId, cmid, "Команда доступна старшему модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "") ?? fromId;
-      const history = await getBanHistory(targetId);
+      if (!(await hasAtLeastRole(peerId, fromId, "senior_moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId } = await extractTarget(args, replyToMessage);
+      const userId = targetId ?? fromId;
+      const history = await getBanHistory(userId);
       if (history.length === 0) {
-        await reply(peerId, cmid, `У ${await nameOf(targetId)} нет истории блокировок.`);
+        await reply(peerId, cmid, `У ${await nameLinkOf(userId)} нет истории блокировок.`);
         return;
       }
-      const lines = [`История блокировок ${await nameOf(targetId)}:`];
+      const lines = [`История блокировок ${await nameLinkOf(userId)}:`];
       for (const h of history.slice(-15)) {
-        lines.push(`${h.type} | ${formatMsk(h.at)} | от ${await nameOf(h.byUserId)} | ${h.reason}`);
+        lines.push(`${h.type} | ${formatMsk(h.at)} | от ${await nameLinkOf(h.byUserId)} | ${h.reason}`);
       }
       await reply(peerId, cmid, lines.join("\n"));
       break;
     }
 
     case "/kick": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /kick @пользователь причина"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const reason = rest.join(" ") || "Не указана";
       await logBanEvent(targetId, { type: "kick", peerId, reason, byUserId: fromId, at: Date.now() });
       await kickFromChat(peerId, targetId);
-      await reply(peerId, cmid, `👢 ${await nameOf(targetId)} кикнут. Причина: ${reason}`);
+      await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из этой беседы пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
 
     case "/skick": {
-      if (!(await hasAtLeastRole(peerId, fromId, "admin"))) {
-        await reply(peerId, cmid, "Команда доступна администратору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /skick @пользователь причина"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const reason = rest.join(" ") || "Не указана";
       await logBanEvent(targetId, { type: "skick", reason, byUserId: fromId, at: Date.now() });
-      const count = await kickFromOwnerGroups(fromId, targetId);
-      await reply(peerId, cmid, `👢 ${await nameOf(targetId)} кикнут из ваших бесед (${count}). Причина: ${reason}`);
+      await kickFromOwnerGroups(fromId, targetId);
+      await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из ваших бесед пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
 
     case "/gkick": {
-      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
-        await reply(peerId, cmid, "Команда доступна спец. и зам. спец. администратору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /gkick @пользователь причина"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const reason = rest.join(" ") || "Не указана";
       await logBanEvent(targetId, { type: "gkick", reason, byUserId: fromId, at: Date.now() });
-      const count = await kickFromAllSyncedChats(targetId);
-      await reply(peerId, cmid, `👢 ${await nameOf(targetId)} кикнут из всех бесед бота (${count}). Причина: ${reason}`);
+      await kickFromAllSyncedChats(targetId);
+      await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из всех бесед бота пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
 
     // --- Мут / тайм-аут / очистка ---
 
     case "/mute": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const minutes = Number(args[1]);
-      const reason = args.slice(2).join(" ") || "не указана";
-      if (!targetId || !minutes) { await reply(peerId, cmid, "Формат: /mute @пользователь минуты причина"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const minutes = Number(rest[0]);
+      const reason = rest.slice(1).join(" ") || "Не указана";
+      if (!minutes) { await reply(peerId, cmid, "Укажите время мута в минутах."); return; }
       await setMute(peerId, targetId, minutes);
-      await reply(peerId, cmid, `🔇 ${await nameOf(targetId)} замучен на ${minutes} мин. Причина: ${reason}`);
+      await reply(peerId, cmid, `${await nameLinkOf(targetId)} замучен на ${minutes} мин. Причина: ${reason}`);
       break;
     }
 
     case "/unmute": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const reason = args.slice(1).join(" ") || "не указана";
-      if (!targetId) { await reply(peerId, cmid, "Формат: /unmute @пользователь причина"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      const reason = rest.join(" ") || "Не указана";
       await clearMute(peerId, targetId);
-      await reply(peerId, cmid, `🔊 Мут снят с ${await nameOf(targetId)}. Причина: ${reason}`);
+      await reply(peerId, cmid, `Мут снят с ${await nameLinkOf(targetId)}. Причина: ${reason}`);
       break;
     }
 
     case "/timeout": {
-      if (!(await hasAtLeastRole(peerId, fromId, "admin"))) {
-        await reply(peerId, cmid, "Команда доступна администратору.");
-        return;
-      }
+      if (!(await hasAtLeastRole(peerId, fromId, "admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       const active = await isTimeoutActive(peerId);
       await setTimeoutMode(peerId, !active);
-      await reply(peerId, cmid, !active ? "🔇 Режим тишины включён." : "🔊 Режим тишины выключен.");
+      await reply(peerId, cmid, !active ? "Режим тишины включён." : "Режим тишины выключен.");
       break;
     }
 
     case "/clear": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
-      if (!replyToMessage) {
-        await reply(peerId, cmid, "Используйте /clear ответом на сообщение, которое нужно удалить.");
-        return;
-      }
-      const targetRole = await resolveUserRole(peerId, replyToMessage.fromId);
-      const myRole = await resolveUserRole(peerId, fromId);
-      if (targetRole.weight >= myRole.weight && replyToMessage.fromId !== fromId) {
-        await reply(peerId, cmid, "Нельзя удалить сообщение пользователя с равным или более высоким рангом.");
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      if (!replyToMessage) { await reply(peerId, cmid, NO_TARGET); return; }
+      if (!(await canActOn(peerId, fromId, replyToMessage.fromId))) {
+        await reply(peerId, cmid, "Вы не можете очистить сообщения данного пользователя!");
         return;
       }
       await callVkApi("messages.delete", {
@@ -623,70 +645,57 @@ async function handleCommand(
         cmids: String(replyToMessage.conversationMessageId),
         delete_for_all: "1",
       });
+      await reply(peerId, cmid, `${await nameLinkOf(fromId)} очистил-(а) сообщение-(я)!`);
       break;
     }
 
     // --- Ники ---
 
     case "/setnick": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      const nick = args.slice(1).join(" ");
-      if (!targetId || !nick) { await reply(peerId, cmid, "Формат: /setnick @пользователь ник"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      const nick = rest.join(" ");
+      if (!nick) { await reply(peerId, cmid, "Укажите ник."); return; }
       await setNickFor(peerId, targetId, nick);
-      await reply(peerId, cmid, `✏️ Ник для ${await nameOf(targetId)} установлен: ${nick}`);
+      await reply(peerId, cmid, `Ник для ${await nameLinkOf(targetId)} установлен: ${nick}`);
       break;
     }
 
     case "/removenick": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      if (!targetId) { await reply(peerId, cmid, "Формат: /removenick @пользователь"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
       await removeNickFor(peerId, targetId);
-      await reply(peerId, cmid, `🗑 Ник для ${await nameOf(targetId)} убран.`);
+      await reply(peerId, cmid, `Ник для ${await nameLinkOf(targetId)} убран.`);
       break;
     }
 
     case "/getnick": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
-      const targetId = parseUserIdFromMention(args[0] ?? "");
-      if (!targetId) { await reply(peerId, cmid, "Формат: /getnick @пользователь"); return; }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
+      const { targetId } = await extractTarget(args, replyToMessage);
+      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
       const nick = await getNickFor(peerId, targetId);
       await reply(peerId, cmid, nick ? `Ник: ${nick}` : "У пользователя нет ника.");
       break;
     }
 
     case "/getacc": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       const nick = args.join(" ");
-      if (!nick) { await reply(peerId, cmid, "Формат: /getacc Ник"); return; }
+      if (!nick) { await reply(peerId, cmid, "Укажите ник."); return; }
       const userId = await findUserIdByNick(peerId, nick);
-      await reply(peerId, cmid, userId ? `Профиль: https://vk.com/id${userId}` : "Ник не найден.");
+      await reply(peerId, cmid, userId ? `Профиль: ${await nameLinkOf(userId)}` : "Ник не найден.");
       break;
     }
 
     case "/nlist": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, "Команда доступна модератору.");
-        return;
-      }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       const nicks = await listNicks(peerId);
       if (nicks.length === 0) { await reply(peerId, cmid, "В чате нет ников."); return; }
       const lines = ["Пользователи с ником:"];
       let i = 1;
-      for (const n of nicks) lines.push(`${i++}) ${await nameOf(n.userId)} — ${n.nick}`);
+      for (const n of nicks) lines.push(`${i++}) ${await nameLinkOf(n.userId)} — ${n.nick}`);
       await reply(peerId, cmid, lines.join("\n"));
       break;
     }
@@ -744,6 +753,18 @@ async function handleMessageNew(body: any) {
   const text = (message.text ?? "").trim();
   const cmid = message.conversation_message_id;
 
+  // Активная блокировка (chat/senior/global) — сразу кикаем, даже если уже в чате.
+  const activeBan = await getActiveBanForChat(peerId, fromId);
+  if (activeBan) {
+    await callVkApi("messages.delete", { peer_id: String(peerId), cmids: String(cmid), delete_for_all: "1" });
+    await kickFromChat(peerId, fromId);
+    await sendMessageAndGetIds(
+      peerId,
+      `${await nameLinkOf(fromId)} исключён-(а) — данный пользователь находится в блокировке.`,
+    );
+    return;
+  }
+
   // Мут: сообщения замученного удаляются молча, команды не обрабатываются.
   if (await isMuted(peerId, fromId)) {
     await callVkApi("messages.delete", { peer_id: String(peerId), cmids: String(cmid), delete_for_all: "1" });
@@ -759,33 +780,26 @@ async function handleMessageNew(body: any) {
     }
   }
 
-  if (text.startsWith("/")) {
-    let [command, ...args] = text.split(/\s+/);
-    command = command.toLowerCase();
+  const replyToMessage: ReplyContext | null = message.reply_message
+    ? { fromId: message.reply_message.from_id, conversationMessageId: message.reply_message.conversation_message_id }
+    : null;
 
-    // Альтернативные названия команд
+  // Символы вызова команды: / + !
+  if (text.length > 1 && ["/", "+", "!"].includes(text[0])) {
+    let [command, ...args] = text.split(/\s+/);
+    command = "/" + command.slice(1).toLowerCase();
+
     const altTarget = ALT_MAP[command.slice(1)];
     if (altTarget) command = altTarget;
 
     const handledAsSetup = await handleSetupCommand(peerId, fromId, cmid, command, args);
     if (handledAsSetup) return;
 
-    if (command === "/help" || command === "/alt") {
-      const replyToMessage = message.reply_message
-        ? { fromId: message.reply_message.from_id, conversationMessageId: message.reply_message.conversation_message_id }
-        : null;
-      await handleCommand(peerId, fromId, cmid, command, args, replyToMessage);
-      return;
-    }
-
-    if (!isDeveloperId(fromId) && !(await isChatConfigured(peerId))) {
+    if (!isDeveloperId(fromId) && !(await isChatConfigured(peerId)) && command !== "/help") {
       await reply(peerId, cmid, await getConfigStatusMessage(peerId));
       return;
     }
 
-    const replyToMessage = message.reply_message
-      ? { fromId: message.reply_message.from_id, conversationMessageId: message.reply_message.conversation_message_id }
-      : null;
     await handleCommand(peerId, fromId, cmid, command, args, replyToMessage);
     return;
   }
@@ -797,7 +811,7 @@ async function handleMessageNew(body: any) {
     const shouldKick = await trackFloodAndShouldKick(peerId, fromId, text);
     if (shouldKick) {
       await kickFromChat(peerId, fromId);
-      await sendMessageAndGetIds(peerId, `👢 ${await nameOf(fromId)} кикнут за флуд.`);
+      await sendMessageAndGetIds(peerId, `${await nameLinkOf(fromId)} исключён-(а) за флуд.`);
     }
   }
 }
@@ -833,17 +847,12 @@ Deno.serve(async (req) => {
     } else if (body.type === "message_event") {
       await handleMessageEvent(body);
     } else if (body.type === "chat_invite_user") {
-      // Повторный кик забаненного, если его пригласили обратно.
       const obj = body.object;
       const peerId = obj.chat_id ? obj.chat_id + 2_000_000_000 : obj.peer_id;
       const userId = obj.user_id;
       if (peerId && userId) {
-        const [globalBan, chatBan, seniorBan] = await Promise.all([
-          getGlobalBan(userId),
-          getChatBan(peerId, userId),
-          isSeniorBannedInChat(peerId, userId),
-        ]);
-        if (globalBan || chatBan || seniorBan) {
+        const ban = await getActiveBanForChat(peerId, userId);
+        if (ban) {
           await kickFromChat(peerId, userId);
         }
       }
