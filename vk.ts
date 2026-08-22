@@ -41,9 +41,9 @@ export async function getUsersInfo(userIds: number[]): Promise<Map<number, VkUse
   return map;
 }
 
-/** Ссылка на профиль в формате "[Имя Фамилия](https://vk.ru/id123)". */
+/** Кликабельное упоминание пользователя в тексте сообщения VK: текст "Имя Фамилия" сам является ссылкой. */
 export function profileLink(userId: number, name: string): string {
-  return `[${name}](https://vk.ru/id${userId})`;
+  return `[id${userId}|${name}]`;
 }
 
 /** Готовая ссылка-упоминание пользователя по его id (одиночный запрос имени). */
