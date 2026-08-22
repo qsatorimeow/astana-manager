@@ -146,6 +146,7 @@ export const ALT_MESSAGE = [
   "/kick — кик",
   "/mute — мут, заткнуть",
   "/unmute — размут, разоткнуть",
+  "/stats — стата",
 ].join("\n");
 
 export const ALT_MAP: Record<string, string> = {
@@ -164,4 +165,5 @@ export const ALT_MAP: Record<string, string> = {
   "размут": "/unmute",
   "разоткнуть": "/unmute",
   "тишина": "/timeout",
+  "стата": "/stats",
 };
