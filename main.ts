@@ -43,8 +43,10 @@ import {
   CHAT_TYPE_LABEL,
   clearSync,
   getConfigStatusMessage,
+  getGroupOwner,
   getOwnerGroups,
   isChatConfigured,
+  isGroupAdded,
   isSynced,
   removeGroup,
   setChatType,
@@ -192,29 +194,38 @@ async function handleSetupCommand(
     }
 
     case "/addgroup": {
-      if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
+      if (!(await hasAtLeastRole(peerId, fromId, "spec_admin"))) {
         await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
       const targetPeer = args[0] ? Number(args[0]) : peerId;
+      if (await isGroupAdded(targetPeer)) {
+        await reply(peerId, cmid, "Эта беседа уже привязана. Сначала нужно её отвязать (/delgroup).");
+        return true;
+      }
       await addGroup(targetPeer, fromId);
       await reply(peerId, cmid, "Данная беседа добавлена в список ваших чатов.");
       return true;
     }
 
     case "/delgroup": {
-      if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
+      if (!(await hasAtLeastRole(peerId, fromId, "spec_admin"))) {
         await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
       const targetPeer = args[0] ? Number(args[0]) : peerId;
-      await removeGroup(targetPeer, fromId);
+      const owner = await getGroupOwner(targetPeer);
+      if (owner !== null && owner !== fromId && !isDeveloperId(fromId)) {
+        await reply(peerId, cmid, NO_PERMISSION);
+        return true;
+      }
+      await removeGroup(targetPeer, owner ?? fromId);
       await reply(peerId, cmid, "Данная беседа удалена из списка ваших чатов.");
       return true;
     }
 
     case "/mygroups": {
-      if (!(await hasAtLeastRole(peerId, fromId, "senior_admin"))) {
+      if (!(await hasAtLeastRole(peerId, fromId, "spec_admin"))) {
         await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
@@ -638,8 +649,22 @@ async function handleCommand(
     case "/timeout": {
       if (!(await hasAtLeastRole(peerId, fromId, "admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       const active = await isTimeoutActive(peerId);
-      await setTimeoutMode(peerId, !active);
-      await reply(peerId, cmid, !active ? "Режим тишины включён." : "Режим тишины выключен.");
+      if (active) {
+        await setTimeoutMode(peerId, false);
+        await reply(peerId, cmid, "Режим тишины выключен.");
+      } else {
+        await setTimeoutMode(peerId, true);
+        const keyboard = JSON.stringify({
+          inline: true,
+          buttons: [[
+            {
+              action: { type: "callback", label: "Выключить", payload: JSON.stringify({ action: "timeout_off" }) },
+              color: "negative",
+            },
+          ]],
+        });
+        await sendMessageAndGetIds(peerId, "Режим тишины включён.", { keyboard, replyToConversationMessageId: cmid });
+      }
       break;
     }
 
@@ -745,6 +770,17 @@ async function handleMessageEvent(body: any) {
       peer_id: String(peerId),
       conversation_message_id: String(obj.conversation_message_id),
       message: `Вы установили тип беседы "${CHAT_TYPE_LABEL[payload.value as "admin" | "player"]}"`,
+    });
+    return;
+  }
+
+  if (payload.action === "timeout_off") {
+    if (!(await hasAtLeastRole(peerId, userId, "admin"))) return;
+    await setTimeoutMode(peerId, false);
+    await callVkApi("messages.edit", {
+      peer_id: String(peerId),
+      conversation_message_id: String(obj.conversation_message_id),
+      message: `${await nameLinkOf(userId)} выключил режим тишины!`,
     });
   }
 }
