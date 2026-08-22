@@ -1,6 +1,6 @@
 // Экономика: баланс (глобальный), 1 сообщение = 1 монета, /reward раз в 3 часа.
 import { redis } from "./kv.ts";
-import { getConversationMembers, getUsersInfo, mention } from "./vk.ts";
+import { getConversationMembers, getUsersInfo, profileLink } from "./vk.ts";
 
 const REWARD_COOLDOWN_MS = 3 * 60 * 60 * 1000; // 3 часа
 const REWARD_MIN = 80;
@@ -105,8 +105,11 @@ export async function getGlobalTop(limit = 10): Promise<{ userId: number; balanc
 export async function formatTopList(entries: { userId: number; balance: number }[]): Promise<string> {
   if (entries.length === 0) return "Пока никто не заработал монет.";
   const infoMap = await getUsersInfo(entries.map((e) => e.userId));
-  const medals = ["🥇", "🥈", "🥉"];
   return entries
-    .map((e, i) => `${medals[i] ?? "🎖"} ${mention(e.userId, infoMap.get(e.userId))} — ${e.balance} монет`)
+    .map((e, i) => {
+      const info = infoMap.get(e.userId);
+      const name = profileLink(e.userId, info ? `${info.first_name} ${info.last_name}` : `id${e.userId}`);
+      return `${i + 1}) ${name} — ${e.balance} монет`;
+    })
     .join("\n");
 }
