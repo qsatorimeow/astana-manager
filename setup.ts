@@ -1,7 +1,7 @@
 // Настройка чата: синхронизация, привязка к серверу старшего администратора, тип беседы.
 // Бот не выполняет обычные команды, пока все три шага не пройдены.
 import { redis } from "./kv.ts";
-import { getUsersInfo, mention } from "./vk.ts";
+import { nameLinkOf } from "./vk.ts";
 
 export type ChatType = "admin" | "player";
 
@@ -47,7 +47,7 @@ export async function buildSyncListMessage(): Promise<string> {
   const lines = ["Список синхронизированных чатов:"];
   for (const peerId of peerIds) {
     const ownerId = await getSyncOwner(peerId);
-    const ownerName = ownerId ? mention(ownerId, (await getUsersInfo([ownerId])).get(ownerId)) : "неизвестно";
+    const ownerName = ownerId ? await nameLinkOf(ownerId) : "неизвестно";
     lines.push(`Чат ${peerId} | ${ownerName}`);
   }
   return lines.join("\n");
