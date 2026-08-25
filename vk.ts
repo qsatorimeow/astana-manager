@@ -72,6 +72,57 @@ export async function getConversationMembers(peerId: number): Promise<Conversati
   }));
 }
 
+/** Кликабельное упоминание сообщества (используется, если владелец беседы — сообщество). */
+export function communityLink(groupId: number, name: string): string {
+  return `[club${groupId}|${name}]`;
+}
+
+/** Получить название сообществ по их положительным id (groups.getById). */
+export async function getCommunitiesInfo(groupIds: number[]): Promise<Map<number, string>> {
+  const map = new Map<number, string>();
+  const positiveIds = [...new Set(groupIds.filter((id) => id > 0))];
+  if (positiveIds.length === 0) return map;
+  const data = await callVkApi("groups.getById", { group_ids: positiveIds.join(",") });
+  const groups = data.response?.groups ?? data.response ?? [];
+  // deno-lint-ignore no-explicit-any
+  for (const g of groups) map.set(g.id, g.name);
+  return map;
+}
+
+/**
+ * Кликабельное упоминание любого участника беседы: пользователя (id > 0)
+ * или сообщества (id < 0, например владелец беседы — паблик).
+ */
+export async function nameLinkOfAny(id: number): Promise<string> {
+  if (id > 0) return await nameLinkOf(id);
+  const groupId = -id;
+  const namesMap = await getCommunitiesInfo([groupId]);
+  const name = namesMap.get(groupId) ?? `club${groupId}`;
+  return communityLink(groupId, name);
+}
+
+/** Список участников беседы, которые сейчас онлайн. */
+export async function getOnlineMembers(peerId: number): Promise<VkUserInfo[]> {
+  const members = await getConversationMembers(peerId);
+  const userIds = members.map((m) => m.memberId).filter((id) => id > 0);
+  if (userIds.length === 0) return [];
+  const data = await callVkApi("users.get", { user_ids: userIds.join(","), fields: "online" });
+  // deno-lint-ignore no-explicit-any
+  return (data.response ?? []).filter((u: any) => u.online === 1);
+}
+
+let cachedBotGroupId: number | null = null;
+
+/** id своего же сообщества (для определения, что бота только что добавили в беседу). */
+export async function getBotGroupId(): Promise<number | null> {
+  if (cachedBotGroupId !== null) return cachedBotGroupId;
+  const data = await callVkApi("groups.getById", {});
+  const groups = data?.response?.groups ?? data?.response ?? [];
+  const id = groups?.[0]?.id;
+  cachedBotGroupId = id ? Number(id) : null;
+  return cachedBotGroupId;
+}
+
 /** peer_id >= 2_000_000_000 — это беседа (групповой чат), а не личные сообщения. */
 export function isChatPeer(peerId: number): boolean {
   return peerId >= 2_000_000_000;
