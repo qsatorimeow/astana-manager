@@ -84,6 +84,7 @@ export const COMMAND_REGISTRY: CommandInfo[] = [
   { cmd: "/alt", description: "альтернативные названия команд", minRole: "moderator" },
   { cmd: "/addmoder", description: "назначить модератора", minRole: "senior_moderator" },
   { cmd: "/delmoder", description: "снять модератора", minRole: "senior_moderator" },
+  { cmd: "/zov", description: "вызвать всех участников (не стафф) с причиной", minRole: "senior_moderator" },
   { cmd: "/ban", description: "бан+кик в этой беседе", minRole: "senior_moderator" },
   { cmd: "/banlist", description: "все баны пользователя", minRole: "senior_moderator" },
 
