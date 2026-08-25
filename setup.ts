@@ -2,12 +2,12 @@
 // Бот не выполняет обычные команды, пока все три шага не пройдены.
 import { redis } from "./kv.ts";
 import { nameLinkOf } from "./vk.ts";
+import { getChatServer } from "./servers.ts";
 
-export type ChatType = "admin" | "player";
+export type ChatType = "admin";
 
 export const CHAT_TYPE_LABEL: Record<ChatType, string> = {
   admin: "Административный чат",
-  player: "Беседа игроков",
 };
 
 // --- Синхронизация (доступно спец. и зам. спец. администратору) ---
@@ -105,22 +105,25 @@ export async function getChatType(peerId: number): Promise<ChatType | null> {
 // --- Общая проверка готовности чата к использованию бота ---
 
 export async function isChatConfigured(peerId: number): Promise<boolean> {
-  const [synced, grouped, type] = await Promise.all([
+  const [synced, server, grouped, type] = await Promise.all([
     isSynced(peerId),
+    getChatServer(peerId),
     isGroupAdded(peerId),
     getChatType(peerId),
   ]);
-  return synced && grouped && type !== null;
+  return synced && server !== null && grouped && type !== null;
 }
 
 export async function getConfigStatusMessage(peerId: number): Promise<string> {
-  const [synced, grouped, type] = await Promise.all([
+  const [synced, server, grouped, type] = await Promise.all([
     isSynced(peerId),
+    getChatServer(peerId),
     isGroupAdded(peerId),
     getChatType(peerId),
   ]);
-  const lines = ["⚙️ Чат ещё не готов к использованию бота. Осталось:"];
+  const lines = ["Чат ещё не готов к использованию бота. Осталось:"];
   if (!synced) lines.push("— /sync (синхронизация с базой данных)");
+  if (!server) lines.push("— /server название (привязать беседу к серверу проекта)");
   if (!grouped) lines.push("— /addgroup (привязать чат к своему списку)");
   if (!type) lines.push("— /type (выбрать тип беседы)");
   return lines.join("\n");
