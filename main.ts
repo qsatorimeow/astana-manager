@@ -456,6 +456,7 @@ async function handleCommand(
         return;
       }
       const lines = [`${callerName}, список пользователей онлайн`];
+      lines.push(""); // Добавляет пустую строку (абзац) перед списком пользователей
       for (const u of online) {
         lines.push(`[id${u.id}|${u.first_name} ${u.last_name}] — 💻`);
       }
@@ -463,6 +464,7 @@ async function handleCommand(
       await reply(peerId, cmid, lines.join("\n"));
       break;
     }
+
 
     // --- Баны и кики ---
 
