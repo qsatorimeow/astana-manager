@@ -4,20 +4,23 @@
 //   VK_TOKEN, VK_CONFIRMATION, VK_SECRET, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
 //   DEVELOPER_IDS — VK ID разработчика(ов) через запятую; разработчик обходит все проверки
 //
-// Бот работает ТОЛЬКО в беседах (не в ЛС). Пока для беседы не пройдены
-// /sync → /addgroup → /type, любые команды кроме этих трёх не работают
-// (кроме разработчика — он может использовать что угодно и где угодно).
+// Бот работает ТОЛЬКО в беседах (не в ЛС), кроме /resetdata — она доступна
+// разработчику ТОЛЬКО в личных сообщениях боту.
+//
+// Полная цепочка настройки беседы: /sync → /server → /addgroup → /type.
+// Пока не выполнен /sync — бот вообще ничего не пишет и не реагирует
+// (кроме разработчика). После /sync — подсказывает, что осталось настроить.
+//
 // Символы вызова команды: / + !
-//
-// Цель команды можно указать: упоминанием, "@screenname", "screenname",
-// "id123", просто "123", ссылкой на профиль, или вообще не указывать —
-// тогда берётся автор сообщения, на которое сделан ответ (reply).
-//
+// Цель команды: упоминанием / "@screenname" / "screenname" / "id123" / "123" /
+// ссылкой на профиль / или ответом (reply) на сообщение пользователя.
 // Каждый ответ бота отправляется реплаем на сообщение, вызвавшее команду.
 
 import { redis } from "./kv.ts";
 import {
   callVkApi,
+  getBotGroupId,
+  getOnlineMembers,
   isChatPeer,
   kickFromChat,
   nameLinkOf,
@@ -28,6 +31,7 @@ import {
   addChatRole,
   addGlobalRole,
   type AnyRole,
+  CHAT_ROLES,
   type ChatRole,
   type GlobalRole,
   hasAtLeastRole,
@@ -35,12 +39,12 @@ import {
   removeChatRole,
   removeGlobalRole,
   resolveUserRole,
+  ROLE_GENITIVE,
   ROLE_LABEL,
 } from "./roles.ts";
 import {
   addGroup,
   buildSyncListMessage,
-  CHAT_TYPE_LABEL,
   clearSync,
   getConfigStatusMessage,
   getGroupOwner,
@@ -52,16 +56,8 @@ import {
   setChatType,
   setSync,
 } from "./setup.ts";
-import {
-  formatTopList,
-  getBalance,
-  getChatTop,
-  getGlobalTop,
-  getMessageStats,
-  trackMessage,
-  transferBalance,
-  tryClaimReward,
-} from "./economy.ts";
+import { addServer, bindChatToServer, buildServersListMessage, getChatServer, removeServer, serverExists } from "./servers.ts";
+import { clearActivity, getMessageStats, trackMessage } from "./activity.ts";
 import {
   type BanRecord,
   clearChatBan,
@@ -121,7 +117,6 @@ interface ReplyContext {
 /**
  * Определяет цель команды: сначала пробует явный аргумент (упоминание/ник/ссылка/id),
  * если не получилось — берёт автора сообщения, на которое дан ответ.
- * Возвращает найденный id и оставшиеся аргументы (без потраченного на цель).
  */
 async function extractTarget(
   args: string[],
@@ -135,10 +130,9 @@ async function extractTarget(
   return { targetId: null, rest: args };
 }
 
-/** Может ли actor воздействовать на target (разработчик — всегда; иначе ранг строго выше). */
+/** Может ли actor воздействовать на target: строго выше рангом. Нельзя на себя и на равных/выше. */
 async function canActOn(peerId: number, actorId: number, targetId: number): Promise<boolean> {
   if (isDeveloperId(actorId)) return true;
-  if (actorId === targetId) return true;
   const [actor, target] = await Promise.all([
     resolveUserRole(peerId, actorId),
     resolveUserRole(peerId, targetId),
@@ -148,6 +142,20 @@ async function canActOn(peerId: number, actorId: number, targetId: number): Prom
 
 function formatBanEntry(record: BanRecord, byName: string): string {
   return `${byName} | ${record.reason} | ${formatMsk(record.at)}`;
+}
+
+/** При кике пользователь полностью теряет все данные, привязанные к этой беседе. */
+async function purgeUserFromChat(peerId: number, userId: number): Promise<void> {
+  for (const role of CHAT_ROLES) {
+    await removeChatRole(peerId, role, userId);
+  }
+  await removeNickFor(peerId, userId);
+  await clearActivity(peerId, userId);
+}
+
+async function kickAndPurge(peerId: number, userId: number): Promise<void> {
+  await kickFromChat(peerId, userId);
+  await purgeUserFromChat(peerId, userId);
 }
 
 // --- Команды настройки (работают даже до полной конфигурации чата) ---
@@ -170,7 +178,7 @@ async function handleSetupCommand(
         return true;
       }
       await setSync(peerId, fromId);
-      await reply(peerId, cmid, "Синхронизация с базой данных прошла успешно!");
+      await reply(peerId, cmid, "Синхронизация с базой данных прошла успешно!\nТеперь привяжите беседу к серверу: /server название");
       return true;
     }
 
@@ -193,6 +201,55 @@ async function handleSetupCommand(
       return true;
     }
 
+    case "/addserver": {
+      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
+        await reply(peerId, cmid, NO_PERMISSION);
+        return true;
+      }
+      const name = args.join(" ");
+      if (!name) { await reply(peerId, cmid, "Формат: /addserver название"); return true; }
+      const created = await addServer(name);
+      await reply(peerId, cmid, created ? `Сервер «${name}» добавлен в список серверов проекта.` : "Сервер с таким названием уже существует.");
+      return true;
+    }
+
+    case "/delserver": {
+      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
+        await reply(peerId, cmid, NO_PERMISSION);
+        return true;
+      }
+      const name = args.join(" ");
+      if (!name) { await reply(peerId, cmid, "Формат: /delserver название"); return true; }
+      await removeServer(name);
+      await reply(peerId, cmid, `Сервер «${name}» удалён из списка серверов проекта.`);
+      return true;
+    }
+
+    case "/servers": {
+      if (!(await hasAtLeastRole(peerId, fromId, "deputy_spec_admin"))) {
+        await reply(peerId, cmid, NO_PERMISSION);
+        return true;
+      }
+      await reply(peerId, cmid, await buildServersListMessage());
+      return true;
+    }
+
+    case "/server": {
+      if (!(await hasAtLeastRole(peerId, fromId, "spec_admin"))) {
+        await reply(peerId, cmid, NO_PERMISSION);
+        return true;
+      }
+      const name = args.join(" ");
+      if (!name) { await reply(peerId, cmid, "Формат: /server название"); return true; }
+      if (!(await serverExists(name))) {
+        await reply(peerId, cmid, "Такого сервера не существует. Сначала /addserver.");
+        return true;
+      }
+      await bindChatToServer(peerId, name);
+      await reply(peerId, cmid, `Вы привязали беседу к серверу: ${name}\nТеперь привяжите чат к себе: /addgroup`);
+      return true;
+    }
+
     case "/addgroup": {
       if (!(await hasAtLeastRole(peerId, fromId, "spec_admin"))) {
         await reply(peerId, cmid, NO_PERMISSION);
@@ -204,7 +261,7 @@ async function handleSetupCommand(
         return true;
       }
       await addGroup(targetPeer, fromId);
-      await reply(peerId, cmid, "Данная беседа добавлена в список ваших чатов.");
+      await reply(peerId, cmid, "Данная беседа добавлена в список ваших чатов.\nТеперь с помощью /type Вы можете выбрать тип беседы!");
       return true;
     }
 
@@ -242,31 +299,9 @@ async function handleSetupCommand(
         await reply(peerId, cmid, NO_PERMISSION);
         return true;
       }
-      const keyboard = JSON.stringify({
-        inline: true,
-        buttons: [[
-          {
-            action: {
-              type: "callback",
-              label: "Административный чат",
-              payload: JSON.stringify({ action: "set_type", value: "admin" }),
-            },
-            color: "primary",
-          },
-          {
-            action: {
-              type: "callback",
-              label: "Беседа игроков",
-              payload: JSON.stringify({ action: "set_type", value: "player" }),
-            },
-            color: "primary",
-          },
-        ]],
-      });
-      await sendMessageAndGetIds(peerId, "Выберите тип беседы:\n1. Административный чат\n2. Беседа игроков", {
-        keyboard,
-        replyToConversationMessageId: cmid,
-      });
+      // Пока доступен только административный тип беседы.
+      await setChatType(peerId, "admin");
+      await reply(peerId, cmid, 'Вы установили тип беседы "Административный чат"');
       return true;
     }
 
@@ -334,7 +369,13 @@ async function handleRankCommand(
     else await removeChatRole(peerId, cfg.role as ChatRole, targetId);
   }
 
-  await reply(peerId, cmid, cfg.action === "add" ? "Ранг назначен." : "Ранг снят.");
+  const genitive = ROLE_GENITIVE[cfg.role];
+  const actorName = await nameLinkOf(fromId);
+  const targetName = await nameLinkOf(targetId);
+  const text = cfg.action === "add"
+    ? `${actorName} выдал-(а) права ${genitive} ${targetName}`
+    : `${actorName} забрал-(а) права ${genitive} у ${targetName}`;
+  await reply(peerId, cmid, text);
   return true;
 }
 
@@ -351,16 +392,6 @@ async function handleCommand(
   if (await handleRankCommand(peerId, fromId, cmid, command, args, replyToMessage)) return;
 
   switch (command) {
-    case "/resetdata": {
-      if (!isDeveloperId(fromId)) { await reply(peerId, cmid, NO_PERMISSION); return; }
-      const keys = await redis.keys("b2:*");
-      if (keys.length > 0) {
-        await redis.del(...keys);
-      }
-      await reply(peerId, cmid, `Удалено ключей: ${keys.length}`);
-      break;
-    }
-
     case "/help": {
       const { weight } = await resolveUserRole(peerId, fromId);
       await reply(peerId, cmid, buildHelpMessage(weight));
@@ -384,53 +415,31 @@ async function handleCommand(
           "/kick — кик",
           "/mute — мут, заткнуть",
           "/unmute — размут, разоткнуть",
+          "/timeout — тишина",
+          "/onlinelist — olist, онлайн",
         ].join("\n"),
       );
       break;
     }
 
     case "/staff": {
-      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) {
-        await reply(peerId, cmid, NO_PERMISSION);
-        return;
-      }
+      if (!(await hasAtLeastRole(peerId, fromId, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       await reply(peerId, cmid, await buildStaffMessage(peerId));
-      break;
-    }
-
-    // --- Экономика ---
-
-    case "/reward": {
-      const result = await tryClaimReward(fromId);
-      if (result.ok) {
-        await reply(peerId, cmid, `Вы получили ${result.amount} монет!`);
-      } else {
-        const minutesLeft = Math.ceil(result.msLeft / 60000);
-        await reply(peerId, cmid, `Следующая награда будет доступна через ${minutesLeft} мин.`);
-      }
-      break;
-    }
-
-    case "/balance": {
-      const balance = await getBalance(fromId);
-      await reply(peerId, cmid, `Ваш баланс: ${balance} монет.`);
       break;
     }
 
     case "/stats": {
       const { targetId } = await extractTarget(args, replyToMessage);
       const statsUserId = targetId ?? fromId;
-      const [role, stats, balance, nick, name] = await Promise.all([
+      const [role, stats, nick, name] = await Promise.all([
         resolveUserRole(peerId, statsUserId),
         getMessageStats(peerId, statsUserId),
-        getBalance(statsUserId),
         getNickFor(peerId, statsUserId),
         nameLinkOf(statsUserId),
       ]);
       const lines = [
         `Информация о пользователе ${name}`,
         `Роль: ${ROLE_LABEL[role.role]}`,
-        `Баланс: ${balance} монет`,
         `Ник: ${nick ?? "Нет"}`,
         `Всего сообщений: ${stats.count}`,
         `Последнее сообщение: ${stats.lastMessageMs ? formatMsk(stats.lastMessageMs) : "нет данных"}`,
@@ -439,25 +448,19 @@ async function handleCommand(
       break;
     }
 
-    case "/pay": {
-      const { targetId, rest } = await extractTarget(args, replyToMessage);
-      const amount = Number(rest[0]);
-      if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
-      if (!amount || amount <= 0) { await reply(peerId, cmid, "Укажите количество монет."); return; }
-      const ok = await transferBalance(fromId, targetId, amount);
-      await reply(peerId, cmid, ok ? `Вы передали ${amount} монет.` : "Недостаточно монет на балансе.");
-      break;
-    }
-
-    case "/top": {
-      const entries = await getChatTop(peerId);
-      await reply(peerId, cmid, `Топ по балансу в чате:\n${await formatTopList(entries)}`);
-      break;
-    }
-
-    case "/gtop": {
-      const entries = await getGlobalTop();
-      await reply(peerId, cmid, `Топ по балансу среди всех пользователей:\n${await formatTopList(entries)}`);
+    case "/onlinelist": {
+      const online = await getOnlineMembers(peerId);
+      const callerName = await nameLinkOf(fromId);
+      if (online.length === 0) {
+        await reply(peerId, cmid, `${callerName}, сейчас никого нет онлайн.`);
+        return;
+      }
+      const lines = [`${callerName}, список пользователей онлайн`];
+      for (const u of online) {
+        lines.push(`[id${u.id}|${u.first_name} ${u.last_name}] — 💻`);
+      }
+      lines.push(`Всего в онлайн: ${online.length}`);
+      await reply(peerId, cmid, lines.join("\n"));
       break;
     }
 
@@ -472,7 +475,7 @@ async function handleCommand(
       const record: BanRecord = { reason, byUserId: fromId, at: Date.now() };
       await setChatBan(peerId, targetId, record);
       await logBanEvent(targetId, { type: "ban", peerId, ...record });
-      await kickFromChat(peerId, targetId);
+      await kickAndPurge(peerId, targetId);
       await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из этой беседы пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
@@ -497,7 +500,8 @@ async function handleCommand(
       const record: BanRecord = { reason, byUserId: fromId, at: Date.now() };
       await setSeniorBan(fromId, targetId, record);
       await logBanEvent(targetId, { type: "sban", ...record });
-      await kickFromOwnerGroups(fromId, targetId);
+      const groups = await getOwnerGroups(fromId);
+      for (const g of groups) await kickAndPurge(g, targetId);
       await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из ваших бесед пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
@@ -522,7 +526,8 @@ async function handleCommand(
       const record: BanRecord = { reason, byUserId: fromId, at: Date.now() };
       await setGlobalBan(targetId, record);
       await logBanEvent(targetId, { type: "gban", ...record });
-      await kickFromAllSyncedChats(targetId);
+      const peerIds = await redis.smembers("b2:synced_chats");
+      for (const p of peerIds ?? []) await kickAndPurge(Number(p), targetId);
       await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из всех бесед бота пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
@@ -592,7 +597,7 @@ async function handleCommand(
       if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       const reason = rest.join(" ") || "Не указана";
       await logBanEvent(targetId, { type: "kick", peerId, reason, byUserId: fromId, at: Date.now() });
-      await kickFromChat(peerId, targetId);
+      await kickAndPurge(peerId, targetId);
       await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из этой беседы пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
@@ -604,7 +609,8 @@ async function handleCommand(
       if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       const reason = rest.join(" ") || "Не указана";
       await logBanEvent(targetId, { type: "skick", reason, byUserId: fromId, at: Date.now() });
-      await kickFromOwnerGroups(fromId, targetId);
+      const groups = await getOwnerGroups(fromId);
+      for (const g of groups) await kickAndPurge(g, targetId);
       await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из ваших бесед пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
@@ -616,7 +622,8 @@ async function handleCommand(
       if (!(await canActOn(peerId, fromId, targetId))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       const reason = rest.join(" ") || "Не указана";
       await logBanEvent(targetId, { type: "gkick", reason, byUserId: fromId, at: Date.now() });
-      await kickFromAllSyncedChats(targetId);
+      const peerIds = await redis.smembers("b2:synced_chats");
+      for (const p of peerIds ?? []) await kickAndPurge(Number(p), targetId);
       await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из всех бесед бота пользователя ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
@@ -740,7 +747,7 @@ async function handleCommand(
   }
 }
 
-// --- Нажатия кнопок (выбор типа беседы) ---
+// --- Нажатия кнопок ---
 
 // deno-lint-ignore no-explicit-any
 async function handleMessageEvent(body: any) {
@@ -763,17 +770,6 @@ async function handleMessageEvent(body: any) {
     return;
   }
 
-  if (payload.action === "set_type" && (payload.value === "admin" || payload.value === "player")) {
-    if (!(await hasAtLeastRole(peerId, userId, "senior_admin"))) return;
-    await setChatType(peerId, payload.value);
-    await callVkApi("messages.edit", {
-      peer_id: String(peerId),
-      conversation_message_id: String(obj.conversation_message_id),
-      message: `Вы установили тип беседы "${CHAT_TYPE_LABEL[payload.value as "admin" | "player"]}"`,
-    });
-    return;
-  }
-
   if (payload.action === "timeout_off") {
     if (!(await hasAtLeastRole(peerId, userId, "admin"))) return;
     await setTimeoutMode(peerId, false);
@@ -793,17 +789,27 @@ async function handleMessageNew(body: any) {
   if (message.out === 1) return;
 
   const peerId = message.peer_id;
-  if (!isChatPeer(peerId)) return; // бот работает только в беседах, ЛС полностью игнорируются
-
   const fromId = message.from_id;
   const text = (message.text ?? "").trim();
+
+  // /resetdata — только разработчик, только в личных сообщениях боту.
+  if (!isChatPeer(peerId)) {
+    const normalized = text.replace(/^[+!]/, "/").toLowerCase();
+    if (normalized === "/resetdata" && isDeveloperId(fromId)) {
+      const keys = await redis.keys("b2:*");
+      if (keys.length > 0) await redis.del(...keys);
+      await sendMessageAndGetIds(peerId, `Удалено ключей: ${keys.length}`);
+    }
+    return; // остальные ЛС полностью игнорируются
+  }
+
   const cmid = message.conversation_message_id;
 
   // Активная блокировка (chat/senior/global) — сразу кикаем, даже если уже в чате.
   const activeBan = await getActiveBanForChat(peerId, fromId);
   if (activeBan) {
     await callVkApi("messages.delete", { peer_id: String(peerId), cmids: String(cmid), delete_for_all: "1" });
-    await kickFromChat(peerId, fromId);
+    await kickAndPurge(peerId, fromId);
     await sendMessageAndGetIds(
       peerId,
       `${await nameLinkOf(fromId)} исключён-(а) — данный пользователь находится в блокировке.`,
@@ -838,6 +844,11 @@ async function handleMessageNew(body: any) {
     const altTarget = ALT_MAP[command.slice(1)];
     if (altTarget) command = altTarget;
 
+    // До /sync бот вообще ничего не пишет и не реагирует (кроме разработчика).
+    if (!isDeveloperId(fromId) && !(await isSynced(peerId)) && command !== "/sync") {
+      return;
+    }
+
     const handledAsSetup = await handleSetupCommand(peerId, fromId, cmid, command, args);
     if (handledAsSetup) return;
 
@@ -850,16 +861,55 @@ async function handleMessageNew(body: any) {
     return;
   }
 
-  // Обычное (не команда) сообщение — считаем для экономики и антифлуда, если чат настроен.
+  // Обычное (не команда) сообщение — учитываем активность и антифлуд, если чат настроен.
   if (await isChatConfigured(peerId)) {
     await trackMessage(peerId, fromId);
 
     const shouldKick = await trackFloodAndShouldKick(peerId, fromId, text);
     if (shouldKick) {
-      await kickFromChat(peerId, fromId);
+      await kickAndPurge(peerId, fromId);
       await sendMessageAndGetIds(peerId, `${await nameLinkOf(fromId)} исключён-(а) за флуд.`);
     }
   }
+}
+
+// --- Добавление в беседу (пользователя или самого бота) ---
+
+// deno-lint-ignore no-explicit-any
+async function handleChatInviteUser(body: any) {
+  const obj = body.object;
+  const peerId: number | undefined = obj.chat_id ? obj.chat_id + 2_000_000_000 : obj.peer_id;
+  const userId: number | undefined = obj.user_id;
+  if (!peerId || !userId) return;
+
+  // Добавили самого бота.
+  if (userId < 0) {
+    const botGroupId = await getBotGroupId();
+    if (botGroupId && -userId === botGroupId) {
+      await sendMessageAndGetIds(
+        peerId,
+        "Бот добавлен в беседу, выдайте мне администратора, а затем введите /sync для синхронизации c базой данных!",
+      );
+    }
+    return;
+  }
+
+  const ban = await getActiveBanForChat(peerId, userId);
+  if (ban) {
+    await kickFromChat(peerId, userId);
+    return;
+  }
+
+  if (!(await isChatConfigured(peerId))) return; // чат ещё не настроен — бот молчит
+
+  await sendMessageAndGetIds(
+    peerId,
+    [
+      `${await nameLinkOf(userId)}, добро пожаловать в беседу!`,
+      "Не забудь прочитать закреплённое сообщение!",
+      'Посмотреть ссылки на официальные ресурсы проекта: «/info»',
+    ].join("\n"),
+  );
 }
 
 Deno.serve(async (req) => {
@@ -893,15 +943,7 @@ Deno.serve(async (req) => {
     } else if (body.type === "message_event") {
       await handleMessageEvent(body);
     } else if (body.type === "chat_invite_user") {
-      const obj = body.object;
-      const peerId = obj.chat_id ? obj.chat_id + 2_000_000_000 : obj.peer_id;
-      const userId = obj.user_id;
-      if (peerId && userId) {
-        const ban = await getActiveBanForChat(peerId, userId);
-        if (ban) {
-          await kickFromChat(peerId, userId);
-        }
-      }
+      await handleChatInviteUser(body);
     }
   } catch (e) {
     console.error("Ошибка обработки события:", e);
