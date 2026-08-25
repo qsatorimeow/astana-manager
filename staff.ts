@@ -1,11 +1,10 @@
 // /staff — полный список рангов беседы. /help и /alt — справка по командам.
-import { getConversationMembers, getUsersInfo, profileLink } from "./vk.ts";
+import { getConversationMembers, getUsersInfo, nameLinkOfAny, profileLink } from "./vk.ts";
 import {
   type AnyRole,
   CHAT_ROLES,
   getChatRoleMembers,
   getGlobalRoleMembers,
-  ROLE_LABEL,
   ROLE_WEIGHT,
 } from "./roles.ts";
 
@@ -18,20 +17,19 @@ export async function buildStaffMessage(peerId: number): Promise<string> {
   ]);
 
   const owner = members.find((m) => m.isOwner);
-  const allIds = [
-    ...(owner ? [owner.memberId] : []),
+  const positiveIds = [
     ...specAdmins,
     ...deputyAdmins,
     ...chatRoleMembers.flat(),
   ];
-  const infoMap = await getUsersInfo(allIds);
+  const infoMap = await getUsersInfo(positiveIds);
   const nameOf = (id: number) => {
     const info = infoMap.get(id);
     return profileLink(id, info ? `${info.first_name} ${info.last_name}` : `id${id}`);
   };
 
   const lines: string[] = [];
-  lines.push(`Владелец беседы — ${owner ? nameOf(owner.memberId) : "Отсутствуют"}`);
+  lines.push(`Владелец беседы — ${owner ? await nameLinkOfAny(owner.memberId) : "Отсутствуют"}`);
   lines.push("");
 
   lines.push("Спец администраторы:");
@@ -68,13 +66,9 @@ interface CommandInfo {
 }
 
 export const COMMAND_REGISTRY: CommandInfo[] = [
-  { cmd: "/reward", description: "получить награду (раз в 3 часа)", minRole: "user" },
-  { cmd: "/balance", description: "ваш баланс", minRole: "user" },
   { cmd: "/stats", description: "статистика профиля", minRole: "user" },
-  { cmd: "/pay", description: "передать монеты другому", minRole: "user" },
-  { cmd: "/top", description: "топ по балансу в чате", minRole: "user" },
-  { cmd: "/gtop", description: "топ по балансу среди всех", minRole: "user" },
   { cmd: "/help", description: "список доступных вам команд", minRole: "user" },
+  { cmd: "/onlinelist", description: "список пользователей онлайн (/olist, «онлайн»)", minRole: "user" },
 
   { cmd: "/staff", description: "список рангов беседы", minRole: "moderator" },
   { cmd: "/clear", description: "удалить сообщение (ответом на него)", minRole: "moderator" },
@@ -93,15 +87,16 @@ export const COMMAND_REGISTRY: CommandInfo[] = [
   { cmd: "/ban", description: "бан+кик в этой беседе", minRole: "senior_moderator" },
   { cmd: "/banlist", description: "все баны пользователя", minRole: "senior_moderator" },
 
-  { cmd: "/timeout", description: "режим тишины в чате", minRole: "admin" },
+  { cmd: "/timeout", description: "режим тишины в чате (альт. «тишина»)", minRole: "admin" },
   { cmd: "/skick", description: "кик из всех ваших бесед", minRole: "admin" },
   { cmd: "/addsenmoder", description: "назначить старшего модератора", minRole: "admin" },
   { cmd: "/delsenmoder", description: "снять старшего модератора", minRole: "admin" },
   { cmd: "/sban", description: "бан+кик во всех ваших беседах", minRole: "admin" },
 
-  { cmd: "/addgroup", description: "привязать беседу к себе", minRole: "senior_admin" },
-  { cmd: "/delgroup", description: "отвязать беседу", minRole: "senior_admin" },
-  { cmd: "/mygroups", description: "список ваших бесед", minRole: "senior_admin" },
+  { cmd: "/addgroup", description: "привязать беседу к себе", minRole: "spec_admin" },
+  { cmd: "/delgroup", description: "отвязать беседу", minRole: "spec_admin" },
+  { cmd: "/mygroups", description: "список ваших бесед", minRole: "spec_admin" },
+  { cmd: "/server", description: "привязать беседу к серверу проекта", minRole: "spec_admin" },
   { cmd: "/type", description: "выбрать тип беседы", minRole: "senior_admin" },
   { cmd: "/addadmin", description: "назначить администратора", minRole: "senior_admin" },
   { cmd: "/deladmin", description: "снять администратора", minRole: "senior_admin" },
@@ -113,6 +108,9 @@ export const COMMAND_REGISTRY: CommandInfo[] = [
   { cmd: "/sync", description: "синхронизация чата с базой", minRole: "deputy_spec_admin" },
   { cmd: "/delsync", description: "удалить синхронизацию", minRole: "deputy_spec_admin" },
   { cmd: "/synclist", description: "список синхронизированных чатов", minRole: "deputy_spec_admin" },
+  { cmd: "/addserver", description: "добавить сервер проекта", minRole: "deputy_spec_admin" },
+  { cmd: "/delserver", description: "удалить сервер проекта", minRole: "deputy_spec_admin" },
+  { cmd: "/servers", description: "список всех серверов проекта", minRole: "deputy_spec_admin" },
   { cmd: "/gban", description: "глобальный бан+кик", minRole: "deputy_spec_admin" },
   { cmd: "/gunban", description: "снять глобальный бан", minRole: "deputy_spec_admin" },
   { cmd: "/gkick", description: "кик из всех бесед бота", minRole: "deputy_spec_admin" },
@@ -122,6 +120,7 @@ export const COMMAND_REGISTRY: CommandInfo[] = [
 
   { cmd: "/addsa", description: "назначить спец. админа", minRole: "developer" },
   { cmd: "/delsa", description: "снять спец. админа", minRole: "developer" },
+  { cmd: "/resetdata", description: "полная очистка данных (только в ЛС боту)", minRole: "developer" },
 ];
 
 export function buildHelpMessage(userWeight: number): string {
@@ -132,22 +131,6 @@ export function buildHelpMessage(userWeight: number): string {
   }
   return lines.join("\n");
 }
-
-export const ALT_MESSAGE = [
-  "Альтернативные названия команд:",
-  "/clear — чистка",
-  "/staff — стафф",
-  "/getnick — gnick, никлист",
-  "/setnick — snick",
-  "/removenick — rnick",
-  "/nlist — ники",
-  "/getacc — аккаунт",
-  "/getban — чекбан",
-  "/kick — кик",
-  "/mute — мут, заткнуть",
-  "/unmute — размут, разоткнуть",
-  "/stats — стата",
-].join("\n");
 
 export const ALT_MAP: Record<string, string> = {
   "чистка": "/clear",
@@ -165,5 +148,6 @@ export const ALT_MAP: Record<string, string> = {
   "размут": "/unmute",
   "разоткнуть": "/unmute",
   "тишина": "/timeout",
-  "стата": "/stats",
+  "olist": "/onlinelist",
+  "онлайн": "/onlinelist",
 };
