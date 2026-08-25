@@ -1,7 +1,7 @@
 // Баны (чат/сервер/глобально), кики, мут, тайм-аут, антифлуд.
 import { redis } from "./kv.ts";
 import { kickFromChat } from "./vk.ts";
-import { getOwnerGroups } from "./setup.ts";
+import { getChatServer, getServerChats } from "./servers.ts";
 
 export type BanEventType = "ban" | "unban" | "sban" | "sunban" | "gban" | "gunban" | "kick" | "skick" | "gkick";
 
@@ -9,6 +9,7 @@ export interface BanRecord {
   reason: string;
   byUserId: number;
   at: number;
+  chatLabel?: string; // название чата/сервера, где выдан бан — для отображения в /getban
 }
 
 export interface BanHistoryEntry extends BanRecord {
@@ -47,50 +48,40 @@ export async function getChatBan(peerId: number, userId: number): Promise<BanRec
   return (await redis.get<BanRecord>(chatBanKey(peerId, userId))) ?? null;
 }
 
-// --- Бан во всех беседах старшего администратора (/sban, /sunban) ---
+// --- Бан во всех беседах СЕРВЕРА (/sban, /sunban) ---
+// Привязка чата к серверу задаётся командой /server (см. servers.ts).
 
-function seniorBanKey(ownerId: number, userId: number): string {
-  return `b2:sban:${ownerId}:${userId}`;
+function serverBanKey(serverNameLower: string, userId: number): string {
+  return `b2:sban:${serverNameLower}:${userId}`;
 }
 
-export async function setSeniorBan(ownerId: number, userId: number, record: BanRecord): Promise<void> {
-  await redis.set(seniorBanKey(ownerId, userId), record);
-  await redis.sadd(`b2:sban_owners:${userId}`, String(ownerId));
+export async function setServerBan(serverName: string, userId: number, record: BanRecord): Promise<void> {
+  const nameLower = serverName.toLowerCase();
+  await redis.set(serverBanKey(nameLower, userId), record);
+  await redis.sadd(`b2:sban_servers:${userId}`, nameLower);
 }
 
-export async function clearSeniorBan(ownerId: number, userId: number): Promise<void> {
-  await redis.del(seniorBanKey(ownerId, userId));
-  await redis.srem(`b2:sban_owners:${userId}`, String(ownerId));
+export async function clearServerBan(serverName: string, userId: number): Promise<void> {
+  const nameLower = serverName.toLowerCase();
+  await redis.del(serverBanKey(nameLower, userId));
+  await redis.srem(`b2:sban_servers:${userId}`, nameLower);
 }
 
-export async function getSeniorBan(ownerId: number, userId: number): Promise<BanRecord | null> {
-  return (await redis.get<BanRecord>(seniorBanKey(ownerId, userId))) ?? null;
+export async function getServerBan(serverName: string, userId: number): Promise<BanRecord | null> {
+  return (await redis.get<BanRecord>(serverBanKey(serverName.toLowerCase(), userId))) ?? null;
 }
 
-export async function getAllSeniorBans(userId: number): Promise<{ ownerId: number; record: BanRecord }[]> {
-  const ownerIds = await redis.smembers(`b2:sban_owners:${userId}`);
-  const result: { ownerId: number; record: BanRecord }[] = [];
-  for (const ownerIdStr of ownerIds ?? []) {
-    const record = await getSeniorBan(Number(ownerIdStr), userId);
-    if (record) result.push({ ownerId: Number(ownerIdStr), record });
+export async function getAllServerBans(userId: number): Promise<{ serverName: string; record: BanRecord }[]> {
+  const serverNames = await redis.smembers(`b2:sban_servers:${userId}`);
+  const result: { serverName: string; record: BanRecord }[] = [];
+  for (const nameLower of serverNames ?? []) {
+    const record = await getServerBan(nameLower, userId);
+    if (record) result.push({ serverName: nameLower, record });
   }
   return result;
 }
 
-/** Забанен ли пользователь через /sban у старшего администратора, чья беседа — peerId. */
-export async function isSeniorBannedInChat(
-  peerId: number,
-  userId: number,
-): Promise<{ ownerId: number; record: BanRecord } | null> {
-  const bans = await getAllSeniorBans(userId);
-  for (const ban of bans) {
-    const groups = await getOwnerGroups(ban.ownerId);
-    if (groups.includes(peerId)) return ban;
-  }
-  return null;
-}
-
-// --- Глобальный бан (/gban, /gunban) ---
+// --- Глобальный бан (/gban, /gunban) — во всех серверах и чатах ---
 
 function globalBanKey(userId: number): string {
   return `b2:gban:${userId}`;
@@ -108,24 +99,30 @@ export async function getGlobalBan(userId: number): Promise<BanRecord | null> {
   return (await redis.get<BanRecord>(globalBanKey(userId))) ?? null;
 }
 
-/** Есть ли у пользователя любая активная блокировка, действующая в этом чате. */
+/** Есть ли у пользователя любая активная блокировка, действующая именно в этом чате. */
 export async function getActiveBanForChat(peerId: number, userId: number): Promise<BanRecord | null> {
   const globalBan = await getGlobalBan(userId);
   if (globalBan) return globalBan;
+
   const chatBan = await getChatBan(peerId, userId);
   if (chatBan) return chatBan;
-  const seniorBan = await isSeniorBannedInChat(peerId, userId);
-  return seniorBan ? seniorBan.record : null;
+
+  const serverName = await getChatServer(peerId);
+  if (serverName) {
+    const serverBan = await getServerBan(serverName, userId);
+    if (serverBan) return serverBan;
+  }
+  return null;
 }
 
-// --- Массовые кики (/skick, /gkick) ---
+// --- Массовые кики (/skick — по серверу, /gkick — везде) ---
 
-export async function kickFromOwnerGroups(ownerId: number, userId: number): Promise<number> {
-  const groups = await getOwnerGroups(ownerId);
-  for (const peerId of groups) {
+export async function kickFromServerChats(serverName: string, userId: number): Promise<number> {
+  const chats = await getServerChats(serverName);
+  for (const peerId of chats) {
     await kickFromChat(peerId, userId).catch(() => {});
   }
-  return groups.length;
+  return chats.length;
 }
 
 export async function kickFromAllSyncedChats(userId: number): Promise<number> {
@@ -180,7 +177,6 @@ function floodKey(peerId: number, userId: number): string {
   return `b2:flood:${peerId}:${userId}`;
 }
 
-/** Возвращает true, если пользователя пора кикнуть за флуд (сбрасывает счётчик). */
 export async function trackFloodAndShouldKick(peerId: number, userId: number, text: string): Promise<boolean> {
   if (!text) return false;
   const raw = await redis.get<FloodState | string>(floodKey(peerId, userId));
