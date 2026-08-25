@@ -27,6 +27,18 @@ export const ROLE_LABEL: Record<AnyRole, string> = {
   user: "Пользователь",
 };
 
+/** Форма "права ___" — родительный падеж, для сообщений о назначении/снятии ранга. */
+export const ROLE_GENITIVE: Record<AnyRole, string> = {
+  developer: "разработчика",
+  spec_admin: "спец. администратора",
+  deputy_spec_admin: "зам. спец. администратора",
+  senior_admin: "старшего администратора",
+  admin: "администратора",
+  senior_moderator: "старшего модератора",
+  moderator: "модератора",
+  user: "пользователя",
+};
+
 const CHAT_ROLES: ChatRole[] = ["senior_admin", "admin", "senior_moderator", "moderator"];
 
 function developerIds(): number[] {
