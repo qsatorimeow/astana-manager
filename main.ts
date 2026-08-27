@@ -1,44 +1,163 @@
-import { Redis } from "npm:@upstash/redis@1.34.3";
-import { callVkApi,isChatPeer,getMembers,getUsersInfo,nameLinkOf,profileLink,resolveTargetUserId,sendMessageAndGetIds,deleteMessages,kickFromChat } from "./vk.ts";
-const redis=new Redis({url:Deno.env.get("UPSTASH_REDIS_REST_URL")??"",token:Deno.env.get("UPSTASH_REDIS_REST_TOKEN")??""});
-const DEV=new Set((Deno.env.get("DEVELOPER_IDS")??"").split(",").map(x=>Number(x.trim())).filter(Boolean));
-const P="bh:";
-type Role="none"|"moderator"|"senior_moderator"|"admin"|"senior_admin"|"deputy_main_admin"|"main_admin"|"deputy_spec_admin"|"spec_admin"|"developer";
-const W:Record<Role,number>={none:0,moderator:1,senior_moderator:2,admin:3,senior_admin:4,deputy_main_admin:5,main_admin:6,deputy_spec_admin:7,spec_admin:8,developer:9};
-const L:Record<Role,string>={none:"Пользователь",moderator:"Модератор",senior_moderator:"Старший модератор",admin:"Администратор",senior_admin:"Старший администратор",deputy_main_admin:"Зам.Главного администратора",main_admin:"Главный администратор",deputy_spec_admin:"Зам.Спец администратора",spec_admin:"Спец администратор",developer:"Разработчик"};
-const now=()=>Date.now(); const fmt=(t:number)=>new Intl.DateTimeFormat("ru-RU",{timeZone:"Europe/Moscow",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).format(new Date(t)).replace(","," ")+" МСК (UTC+3)"; const key=(...x:any[])=>P+x.join(":");
-async function gRole(peer:number,u:number):Promise<Role>{if(DEV.has(u))return"developer";const g=await redis.get<Role>(key("grole",u));if(g)return g;const s=await redis.get<string>(key("server",peer));if(s){const r=await redis.get<Role>(key("srole",s,u));if(r)return r}return(await redis.get<Role>(key("crole",peer,u)))??"none"}
-async function can(peer:number,u:number,r:Role){return W[await gRole(peer,u)]>=W[r]}
-async function userTarget(m:any,args:string[],optional=false){if(m.reply_message?.from_id)return Number(m.reply_message.from_id);if(args[0])return await resolveTargetUserId(args[0]);return optional?Number(m.from_id):null}
-async function reply(peer:number,m:any,text:string,keyboard?:any){return sendMessageAndGetIds(peer,text,{replyTo:Number(m.conversation_message_id)||undefined,keyboard})}
-async function config(peer:number){return !!(await redis.exists(key("sync",peer)))}
-async function sync(peer:number){const d=await callVkApi("messages.getConversationsById",{peer_ids:peer});const x=d?.response?.items?.[0]?.chat_settings;const name=x?.title??`Беседа ${peer}`;const owner=Number(x?.owner_id??0);await redis.hset(key("sync",peer),{chatName:name,ownerId:String(owner),updatedAt:String(now())});await redis.sadd(key("syncs"),peer);return{name,owner}}
-async function syncRec(peer:number){return await redis.hgetall<any>(key("sync",peer))}
-async function serverOf(peer:number){return await redis.get<string>(key("server",peer))}
-async function setRole(peer:number,u:number,r:Role,scope:"g"|"s"|"c",server?:string){if(scope==="g")await redis.set(key("grole",u),r);else if(scope==="s")await redis.set(key("srole",server,u),r);else await redis.set(key("crole",peer,u),r)}
-async function delRole(peer:number,u:number,scope:"g"|"s"|"c",server?:string){if(scope==="g")await redis.del(key("grole",u));else if(scope==="s")await redis.del(key("srole",server,u));else await redis.del(key("crole",peer,u))}
-async function protectedTarget(peer:number,actor:number,target:number){return target===actor||W[await gRole(peer,target)]>=W[await gRole(peer,actor)]}
-async function assign(peer:number,m:any,args:string[],r:Role,need:Role,scope:"g"|"s"|"c",verb:string){const a=Number(m.from_id);if(!await can(peer,a,need))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args);if(!t)return reply(peer,m,"Вы не указали пользователя");if(await protectedTarget(peer,a,t))return reply(peer,m,"Вы не можете выполнить это действие над данным пользователем!");const s=await serverOf(peer);if(scope==="s"&&!s)return reply(peer,m,"Беседа не привязана к серверу.");await setRole(peer,t,r,scope,s??undefined);return reply(peer,m,`${await nameLinkOf(a)} ${verb} ${await nameLinkOf(t)}`)}
-async function unassign(peer:number,m:any,args:string[],r:Role,need:Role,scope:"g"|"s"|"c",verb:string){const a=Number(m.from_id);if(!await can(peer,a,need))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args);if(!t)return reply(peer,m,"Вы не указали пользователя");if(await protectedTarget(peer,a,t))return reply(peer,m,"Вы не можете выполнить это действие над данным пользователем!");const s=await serverOf(peer);if(scope==="s"&&!s)return reply(peer,m,"Беседа не привязана к серверу.");await delRole(peer,t,scope,s??undefined);return reply(peer,m,`${await nameLinkOf(a)} ${verb} ${await nameLinkOf(t)}`)}
-async function addBan(scope:string,target:number,actor:number,reason:string,peer:number){await redis.hset(key("ban",scope,target),{by:String(actor),reason,at:String(now()),rank:String(W[await gRole(peer,actor)])});await redis.sadd(key("banned",scope),target);await redis.rpush(key("history",target),JSON.stringify({scope,peer,by:actor,reason,at:now(),rank:W[await gRole(peer,actor)]}))}
-async function getBan(scope:string,target:number){const b=await redis.hgetall<any>(key("ban",scope,target));return b&&Object.keys(b).length?b:null}
-async function delBan(scope:string,target:number){await redis.del(key("ban",scope,target));await redis.srem(key("banned",scope),target)}
-async function banCmd(peer:number,m:any,args:string[],scope:"g"|"s"|"c",need:Role){const a=Number(m.from_id);if(!await can(peer,a,need))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args);if(!t)return reply(peer,m,"Вы не указали пользователя");if(await protectedTarget(peer,a,t))return reply(peer,m,"Вы не можете выполнить это действие над данным пользователем!");const reason=m.reply_message?args.join(" "):args.slice(1).join(" ");if(!reason)return reply(peer,m,"Вы не указали причину");const s=await serverOf(peer);if(scope==="s"&&!s)return reply(peer,m,"Беседа не привязана к серверу.");const sc=scope==="g"?"g":scope==="s"?`s:${s}`:`c:${peer}`;await addBan(sc,t,a,reason,peer);if(scope==="g"){for(const p of await redis.smembers(key("syncs"))){try{await kickFromChat(Number(p),t)}catch{}}}else if(scope==="s"){for(const p of await redis.smembers(key("syncs"))){if(await serverOf(Number(p))===s)try{await kickFromChat(Number(p),t)}catch{}}}else try{await kickFromChat(peer,t)}catch{}const phrase=scope==="g"?"во всех беседах проекта":scope==="s"?`во всех беседах сервера <<${s}>>`:"блокировку чата";return reply(peer,m,`${await nameLinkOf(a)} заблокировал-(а) ${phrase} ${await nameLinkOf(t)}\nПричина: ${reason}`)}
-async function unbanCmd(peer:number,m:any,args:string[],scope:"g"|"s"|"c",need:Role){const a=Number(m.from_id);if(!await can(peer,a,need))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args);if(!t)return reply(peer,m,"Вы не указали пользователя");const reason=m.reply_message?args.join(" "):args.slice(1).join(" ");if(!reason)return reply(peer,m,"Вы не указали причину");const s=await serverOf(peer);if(scope==="s"&&!s)return reply(peer,m,"Беседа не привязана к серверу.");const sc=scope==="g"?"g":scope==="s"?`s:${s}`:`c:${peer}`;const b=await getBan(sc,t);if(!b)return reply(peer,m,"Блокировка отсутствует");if(Number(b.rank)>=W[await gRole(peer,a)])return reply(peer,m,"Вы не можете снять блокировку, выданную администратором равного или более высокого ранга!");await delBan(sc,t);return reply(peer,m,`${await nameLinkOf(a)} разблокировал-(а) ${scope==="s"?`во всех беседах сервера <<${s}>>`:scope==="g"?"во всех беседах проекта":"пользователя"} ${await nameLinkOf(t)}\nПричина: ${reason}`)}
-async function history(peer:number,m:any,args:string[]){if(!await can(peer,Number(m.from_id),"senior_moderator"))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args);if(!t)return reply(peer,m,"Вы не указали пользователя");const arr=await redis.lrange<string>(key("history",t),0,-1);const rows=[];for(const raw of arr.reverse()){const x=JSON.parse(raw);rows.push(`${x.scope.startsWith("g")?"gban":x.scope.startsWith("s:")?"sban":"ban"} | ${x.peer?((await syncRec(Number(x.peer)))?.chatName??x.peer):"Проект"} | ${await nameLinkOf(Number(x.by))} | ${x.reason} | ${fmt(Number(x.at))}`)}return reply(peer,m,`Список блокировок пользователя ${await nameLinkOf(t)}:\n\n${rows.join("\n")||"Отсутствуют"}`)}
-async function mute(peer:number,m:any,args:string[]){const a=Number(m.from_id);if(!await can(peer,a,"senior_moderator"))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args);if(!t)return reply(peer,m,"Вы не указали пользователя");if(await protectedTarget(peer,a,t))return reply(peer,m,"Вы не можете выполнить это действие над данным пользователем!");let mins=0,reason="";if(m.reply_message){mins=Number(args[0]);reason=args.slice(1).join(" ")}else{mins=Number(args[1]);reason=args.slice(2).join(" ")}if(!Number.isFinite(mins)||mins<=0)return reply(peer,m,"Вы не указали время мута");if(!reason)return reply(peer,m,"Вы не указали причину");const until=now()+mins*60000;await redis.hset(key("mute",peer,t),{by:String(a),reason,at:String(now()),until:String(until),rank:String(W[await gRole(peer,a)])});return reply(peer,m,`${await nameLinkOf(a)} замьютил-(а) ${await nameLinkOf(t)}\nПричина: ${reason}\nМут выдан до: ${fmt(until)}`)}
-async function nicks(peer:number,m:any,args:string[],action:string){const a=Number(m.from_id);if(!await can(peer,a,"moderator"))return reply(peer,m,"Недостаточно прав.");if(action==="list"){const ks=await redis.keys(key("nick",peer,"*"));const rows:any[]=[];for(const k of ks)rows.push({id:Number(k.split(":").pop()),nick:await redis.get<string>(k)});const info=await getUsersInfo(rows.map(x=>x.id));rows.sort((x,y)=>String(x.nick).localeCompare(String(y.nick)));return reply(peer,m,`Пользователи с ником [1 страница]:\n${rows.slice(0,50).map((x,i)=>`${i+1}) ${profileLink(x.id,info.get(x.id)?`${info.get(x.id).first_name} ${info.get(x.id).last_name}`:`id${x.id}`)} — ${x.nick}`).join("\n")||"Отсутствуют"}`)}const t=await userTarget(m,action==="set"?args.slice(1):args);if(!t)return reply(peer,m,"Вы не указали пользователя");if(await protectedTarget(peer,a,t))return reply(peer,m,"Вы не можете выполнить это действие над данным пользователем!");if(action==="set"){const n=m.reply_message?args.join(" "):args.slice(1).join(" ");if(!n)return reply(peer,m,"Вы не указали ник");await redis.set(key("nick",peer,t),n);return reply(peer,m,`${await nameLinkOf(a)} сменил-(а) ник у ${await nameLinkOf(t)}\nНовый ник: ${n}`)}if(action==="del"){if(!(await redis.exists(key("nick",peer,t))))return reply(peer,m,"У Пользователя нет ника");await redis.del(key("nick",peer,t));return reply(peer,m,`${await nameLinkOf(a)} убрал-(а) ник у ${await nameLinkOf(t)}`)}const n=await redis.get<string>(key("nick",peer,t));return reply(peer,m,`Ник пользователя — ${n??"Нет"}`)}
-async function staff(peer:number,m:any){if(!await can(peer,Number(m.from_id),"moderator"))return reply(peer,m,"Недостаточно прав.");const r=await syncRec(peer),server=await serverOf(peer),lines=[`Владелец беседы — ${r?.ownerId?await nameLinkOf(Number(r.ownerId)):"отсутствует"}`,"","Спец администраторы:","Отсутствуют","","Зам.Спец администратора:","Отсутствуют","","Главный администратор:","Отсутствует","","Зам.Главного администратора:","Отсутствует","","Старшие администраторы:","Отсутствуют","","Администраторы:","Отсутствуют","","Старшие модераторы:","Отсутствуют","","Модераторы:","Отсутствуют"];return reply(peer,m,lines.join("\n"))}
-async function handle(m:any){const peer=Number(m.peer_id),a=Number(m.from_id),text=String(m.text??"").trim();if(!isChatPeer(peer)||a<=0)return;const parts=text.split(/\s+/),c=(parts[0]??"").toLowerCase(),args=parts.slice(1);console.log(`[MESSAGE] peer=${peer} user=${a} cmid=${m.conversation_message_id??"-"} cmd=${c}`);if(!c.startsWith("/"))return;
- if(c==="/sync"){if(!await can(peer,a,"deputy_spec_admin"))return reply(peer,m,"Недостаточно прав.");await sync(peer);return reply(peer,m,"Синхронизация с базой данных прошла успешно!")}
- if(c==="/delsync"){if(!await can(peer,a,"deputy_spec_admin"))return reply(peer,m,"Недостаточно прав.");await redis.del(key("sync",peer));await redis.srem(key("syncs"),peer);return reply(peer,m,"Синхронизация с базой данных удалена.")}
- if(c==="/synclist"){if(!await can(peer,a,"deputy_spec_admin"))return reply(peer,m,"Недостаточно прав.");const out=["Список синхронизированных чатов:",""];for(const p of await redis.smembers(key("syncs"))){const r=await syncRec(Number(p));out.push(`"${r?.chatName??p}" | ${r?.ownerId?await nameLinkOf(Number(r.ownerId)):"неизвестно"} | ${p}`)}return reply(peer,m,out.join("\n"))}
- if(c==="/addserver"||c==="/delserver"){if(!await can(peer,a,"spec_admin"))return reply(peer,m,"Недостаточно прав.");const n=args.join(" ");if(!n)return reply(peer,m,"Вы не указали название сервера");if(c==="/addserver"){await redis.sadd(key("servers"),n);return reply(peer,m,`Сервер <<${n}>> добавлен в список серверов проекта`)}await redis.srem(key("servers"),n);return reply(peer,m,`Сервер <<${n}>> удален из списков серверов проекта`)}
- if(c==="/server"){if(!await can(peer,a,"spec_admin"))return reply(peer,m,"Недостаточно прав.");if(!await config(peer))return reply(peer,m,"Сначала выполните /sync");const n=args.join(" ");if(!n)return reply(peer,m,"Вы не указали название сервера");if(!(await redis.sismember(key("servers"),n)))return reply(peer,m,"Данного сервера не существует");await redis.set(key("server",peer),n);return reply(peer,m,`Вы привязали данную беседу в список бесед сервера <<${n}>>`)}
- if(c==="/servers"){if(!await can(peer,a,"spec_admin"))return reply(peer,m,"Недостаточно прав.");const out=["Список всех серверов проекта:",""];for(const s of await redis.smembers(key("servers"))){out.push(`Сервер <<${s}>>, Главный администратор — отсутствует`);for(const p of await redis.keys(key("server","*"))){if(await redis.get<string>(p)===s){const peer2=Number(p.split(":").pop());const r=await syncRec(peer2);out.push(`\"${r?.chatName??peer2}\" | ${r?.ownerId?await nameLinkOf(Number(r.ownerId)):"неизвестно"} | ${peer2}`)}}out.push("")}return reply(peer,m,out.join("\n").trim())}
- if(c==="/addsa")return assign(peer,m,args,"spec_admin","developer","g","выдал-(а) права спец. администратора");if(c==="/delsa")return unassign(peer,m,args,"spec_admin","developer","g","забрал-(а) права спец. администратора у");if(c==="/addzsa")return assign(peer,m,args,"deputy_spec_admin","spec_admin","g","выдал-(а) права зам. спец. администратора");if(c==="/delzsa")return unassign(peer,m,args,"deputy_spec_admin","spec_admin","g","забрал-(а) права зам. спец. администратора у");if(c==="/addserverga")return assign(peer,m,args,"main_admin","deputy_spec_admin","s","выдал-(а) права главного администратора");if(c==="/delserverga")return unassign(peer,m,args,"main_admin","deputy_spec_admin","s","забрал-(а) права главного администратора у");if(c==="/addzga")return assign(peer,m,args,"deputy_main_admin","main_admin","s","выдал-(а) права зам. главного администратора");if(c==="/delzga")return unassign(peer,m,args,"deputy_main_admin","main_admin","s","забрал-(а) права зам. главного администратора у");if(c==="/addsenadmin")return assign(peer,m,args,"senior_admin","deputy_main_admin","c","выдал-(а) права старшего администратора");if(c==="/delsenadmin")return unassign(peer,m,args,"senior_admin","deputy_main_admin","c","забрал-(а) права старшего администратора у");if(c==="/addadmin")return assign(peer,m,args,"admin","senior_admin","c","выдал-(а) права администратора");if(c==="/deladmin")return unassign(peer,m,args,"admin","senior_admin","c","забрал-(а) права администратора у");if(c==="/addsenmoder")return assign(peer,m,args,"senior_moderator","admin","c","выдал-(а) права старшего модератора");if(c==="/delsenmoder")return unassign(peer,m,args,"senior_moderator","admin","c","забрал-(а) права старшего модератора у");if(c==="/addmoder")return assign(peer,m,args,"moderator","senior_moderator","c","выдал-(а) права модератора");if(c==="/delmoder")return unassign(peer,m,args,"moderator","senior_moderator","c","забрал-(а) права модератора у");
- if(!await config(peer))return;
- await redis.incr(key("messages",peer,a));await redis.set(key("last",peer,a),String(now()));
- if(c==="/gban")return banCmd(peer,m,args,"g","deputy_spec_admin");if(c==="/gunban")return unbanCmd(peer,m,args,"g","deputy_spec_admin");if(c==="/gkick"){if(!await can(peer,a,"deputy_spec_admin"))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args),reason=args.slice(m.reply_message?0:1).join(" ");if(!t)return reply(peer,m,"Вы не указали пользователя");if(!reason)return reply(peer,m,"Вы не указали причину");for(const p of await redis.smembers(key("syncs"))){try{await kickFromChat(Number(p),t)}catch{}}return reply(peer,m,`${await nameLinkOf(a)} исключил-(а) во всех беседах проекта ${await nameLinkOf(t)}\nПричина: ${reason}`)}if(c==="/sban")return banCmd(peer,m,args,"s","deputy_main_admin");if(c==="/sunban")return unbanCmd(peer,m,args,"s","main_admin");if(c==="/skick"){if(!await can(peer,a,"deputy_main_admin"))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args),s=await serverOf(peer),reason=args.slice(m.reply_message?0:1).join(" ");if(!t)return reply(peer,m,"Вы не указали пользователя");if(!s)return reply(peer,m,"Беседа не привязана к серверу.");if(!reason)return reply(peer,m,"Вы не указали причину");for(const p of await redis.smembers(key("syncs"))){if(await serverOf(Number(p))===s)try{await kickFromChat(Number(p),t)}catch{}}return reply(peer,m,`${await nameLinkOf(a)} исключил-(а) во всех беседах сервера <<${s}>> ${await nameLinkOf(t)}\nПричина: ${reason}`)}if(c==="/ban")return banCmd(peer,m,args,"c","senior_admin");if(c==="/unban")return unbanCmd(peer,m,args,"c","deputy_main_admin");if(c==="/banlist")return history(peer,m,args);if(c==="/getban"){if(!await can(peer,a,"moderator"))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args);if(!t)return reply(peer,m,"Вы не указали пользователя");const g=await getBan("g",t),s=await serverOf(peer),sb=s?await getBan(`s:${s}`,t):null,cb=await getBan(`c:${peer}`,t);const row=(x:any)=>x?`${await nameLinkOf(Number(x.by))} | ${x.reason} | ${fmt(Number(x.at))}`:"";return reply(peer,m,`Информация о блокировках ${await nameLinkOf(t)}\n\nГлобальная блокировка — ${g?"Да":"Нет"}\n${row(g)}\n\nБлокировки в беседах серверов —\n${sb?`1) Блокировка сервера <<${s}>> | ${row(sb)}`:""}\n\nБлокировка в этой беседе —\n${row(cb)}`)}if(c==="/kick"||c==="/skick"){const need=c==="/kick"?"moderator":"deputy_main_admin" as Role;if(!await can(peer,a,need))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args),reason=args.slice(m.reply_message?0:1).join(" ");if(!t)return reply(peer,m,"Вы не указали пользователя");if(await protectedTarget(peer,a,t))return reply(peer,m,"Вы не можете выполнить это действие над данным пользователем!");if(!reason)return reply(peer,m,"Вы не указали причину");if(c==="/kick")await kickFromChat(peer,t);else{const s=await serverOf(peer);if(!s)return reply(peer,m,"Беседа не привязана к серверу.");for(const p of await redis.smembers(key("syncs"))){if(await serverOf(Number(p))===s)try{await kickFromChat(Number(p),t)}catch{}}}return reply(peer,m,`${await nameLinkOf(a)} исключил-(а) ${await nameLinkOf(t)}\nПричина: ${reason}`)}if(c==="/mute")return mute(peer,m,args);if(c==="/unmute"){if(!await can(peer,a,"senior_moderator"))return reply(peer,m,"Недостаточно прав.");const t=await userTarget(m,args);if(!t)return reply(peer,m,"Вы не указали пользователя");await redis.del(key("mute",peer,t));return reply(peer,m,`${await nameLinkOf(a)} размьютил-(а) ${await nameLinkOf(t)}`)}if(c==="/timeout"){if(!await can(peer,a,"admin"))return reply(peer,m,"Недостаточно прав.");const on=(await redis.get(key("timeout",peer)))!=="1";await redis.set(key("timeout",peer),on?"1":"0");return reply(peer,m,on?`${await nameLinkOf(a)} включил режим тишины`:`${await nameLinkOf(a)} выключил режим тишины`)}if(c==="/clear"){if(!await can(peer,a,"senior_moderator"))return reply(peer,m,"Недостаточно прав.");const ids:number[]=[];if(m.reply_message?.id)ids.push(Number(m.reply_message.id));for(const x of m.fwd_messages??[])if(x.id)ids.push(Number(x.id));if(!ids.length)return reply(peer,m,"Вы не указали сообщение для очистки");if(m.reply_message?.from_id&&await protectedTarget(peer,a,Number(m.reply_message.from_id)))return reply(peer,m,"Вы не можете очистить сообщения данного пользователя!");await deleteMessages(peer,ids);return reply(peer,m,"Алексей Белов очистил-(а) сообщение-(я)!")}
- if(c==="/setnick")return nicks(peer,m,args,"set");if(c==="/removenick")return nicks(peer,m,args,"del");if(c==="/getnick")return nicks(peer,m,args,"get");if(c==="/nlist")return nicks(peer,m,args,"list");if(c==="/getacc"){if(!await can(peer,a,"moderator"))return reply(peer,m,"Недостаточно прав.");if(!args.length)return reply(peer,m,"Вы не указали ник");const ks=await redis.keys(key("nick",peer,"*"));for(const k of ks){const n=await redis.get<string>(k);if(n?.toLowerCase()===args.join(" ").toLowerCase())return reply(peer,m,`Ник ${args.join(" ")} принадлежит — ${await nameLinkOf(Number(k.split(":").pop()))}`)}return reply(peer,m,`Ник ${args.join(" ")} не найден`)}if(c==="/staff")return staff(peer,m);if(c==="/alt")return reply(peer,m,"Альтернативные команды\n\n/alt — альт\n/clear — чистка\n/staff — стафф\n/getnick — gnick, никлист, гетник\n/setnick — snick\n/removenick — rnick\n/nlist — ники\n/getacc — аккаунт, гетакк\n/getban — чекбан, гетбан\n/kick — кик, кикнуть\n/mute — мут, заткнуть\n/unmute — размут, разоткнуть\n/stats — стата, статс");if(c==="/olist"){if(!await can(peer,a,"admin"))return reply(peer,m,"Недостаточно прав.");const mem=await getMembers(peer),ids=mem.map((x:any)=>Number(x.member_id??x.memberId)).filter((x:number)=>x>0),info=await getUsersInfo(ids),online=ids.filter(id=>info.get(id)?.online);return reply(peer,m,`${online.map(id=>`${profileLink(id,`${info.get(id)?.first_name??"id"} ${info.get(id)?.last_name??id}`)} — 💻`).join("\n")||"Никого нет"}\nВсего в онлайн: ${online.length}`)}if(c==="/zov"){if(!await can(peer,a,"admin"))return reply(peer,m,"Недостаточно прав.");const reason=args.join(" ");if(!reason)return reply(peer,m,"Вы не указали причину");const mem=await getMembers(peer),ids=mem.map((x:any)=>Number(x.member_id??x.memberId)).filter((x:number)=>x>0&&x!==a);return reply(peer,m,`${ids.map(id=>`[id${id}|🖤]`).join(" ")}\n\n🔔 Вы были вызваны администратором беседы\n\n🖤🖤🖤🖤🖤🖤\n\n❗ Причина вызова: ${reason}`)}if(c==="/stats"){const t=await userTarget(m,args,true),r=await gRole(peer,t),nick=await redis.get<string>(key("nick",peer,t)),cnt=Number(await redis.get(key("messages",peer,t))??0),last=Number(await redis.get(key("last",peer,t))??0),cb=await getBan(`c:${peer}`,t);return reply(peer,m,`Информация о пользователе ${await nameLinkOf(t)}\nРоль: ${L[r]}\nБлокировок: ${(await redis.llen(key("history",t)))||0} (все)\nБлокировка чата: ${cb?"Да":"Нет"}\nНик: ${nick??"Нет"}\nВсего сообщений: ${cnt}\nПоследнее сообщение: ${last?fmt(last):"Нет"}`)}if(c==="/help"){const r=await gRole(peer,a),all=["/info","/stats","/help"];if(W[r]>=W.moderator)all.push("/setnick","/removenick","/getacc","/getnick","/alt","/nlist","/staff","/getban");if(W[r]>=W.senior_moderator)all.push("/addmoder","/delmoder","/mute","/unmute","/clear");if(W[r]>=W.admin)all.push("/addsenmoder","/delsenmoder","/timeout","/olist","/zov");if(W[r]>=W.senior_admin)all.push("/ban","/addadmin","/deladmin","/banlist");if(W[r]>=W.deputy_main_admin)all.push("/sban","/unban","/addsenadmin","/delsenadmin","/skick");if(W[r]>=W.main_admin)all.push("/sunban","/addzga","/delzga");if(W[r]>=W.deputy_spec_admin)all.push("/sync","/delsync","/synclist","/addserverga","/delserverga","/gban","/gunban","/gkick");if(W[r]>=W.spec_admin)all.push("/addserver","/delserver","/server","/servers");if(W[r]>=W.developer)all.push("/addsa","/delsa");return reply(peer,m,"Список доступных вам команд:\n\n"+all.join("\n"))}if(c==="/info")return reply(peer,m,"Официальные ресурсы проекта:\nРазработчик — https://vk.com/id1104716287\nТех поддержка — https://vk.com/id1104716287\nНачать сотрудничество — https://vk.ru/id1104716287\nСпец администратор — https://vk.ru/id1104716287");}
-Deno.serve(async req=>{try{if(req.method!=="POST")return new Response("ok");const body=await req.json();console.log(`[WEBHOOK] type=${body.type??"?"}`);if(body.type==="confirmation")return new Response(Deno.env.get("VK_CONFIRMATION")??"");if(Deno.env.get("VK_SECRET")&&body.secret!==Deno.env.get("VK_SECRET"))return new Response("bad",{status:403});if(body.type==="message_new"){const m=body.object?.message??body.object;if(m)await handle(m)}return new Response("ok")}catch(e){console.error("[WEBHOOK ERROR]",e);return new Response("ok")}});
+import { redis } from "./kv.ts";
+import { callVkApi, isChatPeer, sendMessageAndGetIds, getMembers, getUsersInfo, nameLinkOf } from "./vk.ts";
+import { addServer, removeServer, serverExists, listServers, bindChatToServer, getChatServer, getServerChats } from "./servers.ts";
+import { resolveUserRole, hasAtLeastRole, ROLE_LABEL, type AnyRole } from "./roles.ts";
+
+const DEV = new Set((Deno.env.get("DEVELOPER_IDS") ?? "").split(",").map(x => Number(x.trim())).filter(Boolean));
+const P = "b2:";
+const key = (...parts: (string | number)[]) => P + parts.join(":");
+
+function role(peer: number, user: number): Promise<{ role: AnyRole; weight: number }> {
+  return resolveUserRole(peer, user, null);
+}
+async function can(peer: number, user: number, min: AnyRole) {
+  if (DEV.has(user)) return true;
+  return hasAtLeastRole(peer, user, await getChatServer(peer), min);
+}
+async function reply(peer: number, m: any, text: string, keyboard?: any) {
+  const cmid = Number(m.conversation_message_id ?? 0) || undefined;
+  return sendMessageAndGetIds(peer, text, { replyTo: cmid, keyboard });
+}
+async function synced(peer: number) { return (await redis.exists(key("sync", peer))) === 1; }
+async function configured(peer: number) { return (await synced(peer)) && (await getChatServer(peer)) !== null; }
+
+async function syncChat(peer: number, by: number) {
+  const info = await callVkApi("messages.getConversationsById", { peer_ids: String(peer) });
+  const members = await getMembers(peer);
+  const settings = info?.response?.items?.[0]?.chat_settings;
+  const owner = members.find((x: any) => x.isOwner);
+  const record = {
+    chatName: settings?.title ?? `Беседа ${peer}`,
+    ownerId: Number(owner?.member_id ?? owner?.memberId ?? settings?.owner_id ?? 0),
+    syncedBy: by,
+    syncedAt: Date.now(),
+  };
+  await redis.set(key("sync", peer), record);
+  await redis.sadd(key("synced_chats"), String(peer));
+  return record;
+}
+
+async function handle(m: any) {
+  const peer = Number(m?.peer_id ?? 0);
+  const user = Number(m?.from_id ?? 0);
+  if (!isChatPeer(peer) || user <= 0) return; // ЛС полностью игнорируются.
+
+  const text = String(m?.text ?? "").trim();
+  if (!text.startsWith("/")) return;
+  const [raw, ...args] = text.split(/\s+/);
+  const cmd = raw.toLowerCase();
+  console.log(`[MESSAGE] peer=${peer} user=${user} cmid=${m.conversation_message_id ?? "-"} cmd=${cmd}`);
+
+  // Эти команды доступны до полной настройки.
+  if (cmd === "/sync") {
+    if (!await can(peer, user, "deputy_spec_admin")) return reply(peer, m, "Недостаточно прав.");
+    await syncChat(peer, user);
+    return reply(peer, m, "Синхронизация с базой данных прошла успешно!");
+  }
+  if (cmd === "/delsync") {
+    if (!await can(peer, user, "deputy_spec_admin")) return reply(peer, m, "Недостаточно прав.");
+    await redis.del(key("sync", peer));
+    await redis.srem(key("synced_chats"), String(peer));
+    return reply(peer, m, "Синхронизация с базой данных удалена.");
+  }
+  if (cmd === "/synclist") {
+    if (!await can(peer, user, "deputy_spec_admin")) return reply(peer, m, "Недостаточно прав.");
+    const ids = await redis.smembers(key("synced_chats"));
+    const lines = ["Список синхронизированных чатов:", ""];
+    for (const id of ids ?? []) {
+      const r = await redis.get<any>(key("sync", id));
+      lines.push(`"${r?.chatName ?? id}" | ${r?.ownerId ? await nameLinkOf(Number(r.ownerId)) : "неизвестно"} | ${id}`);
+    }
+    return reply(peer, m, lines.join("\n"));
+  }
+  if (cmd === "/addserver") {
+    if (!await can(peer, user, "spec_admin")) return reply(peer, m, "Недостаточно прав.");
+    const name = args.join(" ").trim();
+    if (!name) return reply(peer, m, "Вы не указали название сервера");
+    if (!(await addServer(name))) return reply(peer, m, "Данный сервер уже существует");
+    return reply(peer, m, `Сервер <<${name}>> добавлен в список серверов проекта`);
+  }
+  if (cmd === "/delserver") {
+    if (!await can(peer, user, "spec_admin")) return reply(peer, m, "Недостаточно прав.");
+    const name = args.join(" ").trim();
+    if (!name) return reply(peer, m, "Вы не указали название сервера");
+    await removeServer(name);
+    return reply(peer, m, `Сервер <<${name}>> удален из списков серверов проекта`);
+  }
+  if (cmd === "/server") {
+    if (!await can(peer, user, "spec_admin")) return reply(peer, m, "Недостаточно прав.");
+    if (!await synced(peer)) return reply(peer, m, "Сначала выполните /sync");
+    const name = args.join(" ").trim();
+    if (!name) return reply(peer, m, "Вы не указали название сервера");
+    if (!(await serverExists(name))) return reply(peer, m, "Данного сервера не существует");
+    await bindChatToServer(peer, name);
+    return reply(peer, m, `Вы привязали данную беседу в список бесед сервера <<${name}>>`);
+  }
+  if (cmd === "/servers") {
+    if (!await can(peer, user, "spec_admin")) return reply(peer, m, "Недостаточно прав.");
+    const names = await listServers();
+    const lines = ["Список всех серверов проекта:", ""];
+    for (const name of names) {
+      lines.push(`Сервер <<${name}>>`);
+      for (const p of await getServerChats(name)) {
+        const r = await redis.get<any>(key("sync", p));
+        lines.push(`"${r?.chatName ?? p}" | ${r?.ownerId ? await nameLinkOf(Number(r.ownerId)) : "неизвестно"} | ${p}`);
+      }
+      lines.push("");
+    }
+    return reply(peer, m, lines.join("\n").trim() || "Серверов нет.");
+  }
+
+  // После sync + server обычные команды начинают работать.
+  if (!await configured(peer)) return;
+
+  if (cmd === "/info") {
+    const r = await role(peer, user);
+    const rec = await redis.get<any>(key("sync", peer));
+    return reply(peer, m, `Информация о беседе\nНазвание: ${rec?.chatName ?? "Неизвестно"}\nID: ${peer}\nВаша роль: ${ROLE_LABEL[r.role]}`);
+  }
+  if (cmd === "/help") {
+    const r = await role(peer, user);
+    const all = ["/info", "/help", "/stats"];
+    if (r.weight >= 40) all.push("/setnick", "/removenick", "/getnick", "/getacc", "/nlist", "/staff", "/getban", "/clear");
+    if (r.weight >= 50) all.push("/mute", "/unmute");
+    if (r.weight >= 60) all.push("/addmoder", "/delmoder", "/timeout");
+    if (r.weight >= 70) all.push("/ban", "/unban", "/banlist");
+    if (r.weight >= 80) all.push("/sban", "/sunban", "/skick");
+    if (r.weight >= 90) all.push("/gban", "/gunban", "/gkick");
+    return reply(peer, m, "Список доступных вам команд:\n\n" + all.join("\n"));
+  }
+  if (cmd === "/stats") {
+    const target = user;
+    const info = await getUsersInfo([target]);
+    const u = info.get(target);
+    const r = await role(peer, target);
+    const count = Number(await redis.get(key("messages", peer, target)) ?? 0);
+    const last = Number(await redis.get(key("last", peer, target)) ?? 0);
+    const lastText = last ? new Intl.DateTimeFormat("ru-RU", { timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "medium" }).format(new Date(last)) + " МСК (UTC+3)" : "Нет";
+    return reply(peer, m, `Информация о пользователе ${u ? `[id${target}|${u.first_name} ${u.last_name}]` : `[id${target}|id${target}]`}\nРоль: ${ROLE_LABEL[r.role]}\nНик: ${await redis.get<string>(key("nick", peer, target)) ?? "Нет"}\nВсего сообщений: ${count}\nПоследнее сообщение: ${lastText}`);
+  }
+
+  // Считаем сообщения только в настроенной беседе.
+  await redis.incr(key("messages", peer, user));
+  await redis.set(key("last", peer, user), String(Date.now()));
+}
+
+Deno.serve(async (req) => {
+  try {
+    if (req.method !== "POST") return new Response("ok");
+    const body = await req.json();
+    console.log(`[WEBHOOK] type=${body?.type ?? "?"}`);
+    if (body?.type === "confirmation") return new Response(Deno.env.get("VK_CONFIRMATION") ?? "");
+    const secret = Deno.env.get("VK_SECRET");
+    if (secret && body?.secret !== secret) return new Response("bad", { status: 403 });
+    if (body?.type === "message_new") {
+      const message = body?.object?.message ?? body?.object;
+      if (message) await handle(message);
+    }
+    return new Response("ok");
+  } catch (e) {
+    console.error("[WEBHOOK ERROR]", e);
+    return new Response("ok");
+  }
+});
