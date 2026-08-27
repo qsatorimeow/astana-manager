@@ -12,7 +12,19 @@ export async function getUsersInfo(ids:number[]){const out=new Map<number,any>()
 export function profileLink(id:number,name:string){return`[id${id}|${name}]`}
 export async function nameLinkOf(id:number){const m=await getUsersInfo([id]);const u=m.get(id);return profileLink(id,u?`${u.first_name} ${u.last_name}`:`id${id}`)}
 export async function resolveTargetUserId(raw:string):Promise<number|null>{let s=raw.trim();if(!s)return null;let m=s.match(/\[id(\d+)\|/);if(m)return Number(m[1]);s=s.replace(/^https?:\/\/(www\.)?(vk\.com|vk\.ru)\//i,"").replace(/^@/,"");m=s.match(/^id(\d+)$/i);if(m)return Number(m[1]);if(/^\d+$/.test(s))return Number(s);const d=await callVkApi("utils.resolveScreenName",{screen_name:s});return d?.response?.type==="user"?Number(d.response.object_id):null}
-export async function sendMessageAndGetIds(peer:number,text:string,opts:{replyTo?:number;keyboard?:any}={}):Promise<{messageId?:number;conversationMessageId?:number}>{const p:any={peer_id:peer,message:text,random_id:Math.floor(Math.random()*2147483647)};if(opts.replyTo)p.reply_to=opts.replyTo;if(opts.keyboard)p.keyboard=typeof opts.keyboard==="string"?opts.keyboard:JSON.stringify(opts.keyboard);const d=await callVkApi("messages.send",p);console.log(`[VK SEND] peer=${peer} reply_to=${opts.replyTo??"-"} response=${JSON.stringify(d?.response??null)}`);const id=Number(d?.response??0);return id>0?{messageId:id}:{} }
+export async function sendMessageAndGetIds(peer:number,text:string,opts:{replyTo?:number;keyboard?:any}={}):Promise<{messageId?:number;conversationMessageId?:number}>{
+ const p:any={peer_id:peer,message:text,random_id:Math.floor(Math.random()*2147483647)};
+ if(opts.replyTo){
+   // In VK conversations the reliable way to create a visual reply is the forward
+   // object with the conversation_message_id and is_reply=true. Using only
+   // messages.send.reply_to can attach to an unrelated message in a conversation.
+   p.forward=JSON.stringify({peer_id:peer,conversation_message_ids:[Number(opts.replyTo)],is_reply:1});
+ }
+ if(opts.keyboard)p.keyboard=typeof opts.keyboard==="string"?opts.keyboard:JSON.stringify(opts.keyboard);
+ const d=await callVkApi("messages.send",p);
+ console.log(`[VK SEND] peer=${peer} reply_to_cmid=${opts.replyTo??"-"} response=${JSON.stringify(d?.response??null)}`);
+ const id=Number(d?.response??0);return id>0?{messageId:id}:{}
+}
 export const send=sendMessageAndGetIds;
 export async function deleteMessages(peer:number,ids:number[]){if(ids.length)await callVkApi("messages.delete",{message_ids:ids.join(","),delete_for_all:1})}
 export async function kickFromChat(peer:number,user:number){return callVkApi("messages.removeChatUser",{chat_id:toChatId(peer),member_id:user})}
