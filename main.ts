@@ -12,7 +12,18 @@ async function reply(peer:number,m:any,text:string,keyboard?:any){const cmid=Num
 async function synced(peer:number){return(await redis.exists(key("sync",peer)))===1}
 async function configured(peer:number){return await synced(peer)&&await getChatServer(peer)!==null}
 async function syncChat(peer:number,by:number){const info=await callVkApi("messages.getConversationsById",{peer_ids:String(peer)});const members=await getMembers(peer);const settings=info?.response?.items?.[0]?.chat_settings;const owner=members.find((x:any)=>x.isOwner);const record={chatName:settings?.title??`Беседа ${peer}`,ownerId:Number(owner?.member_id??owner?.memberId??settings?.owner_id??0),syncedBy:by,syncedAt:Date.now()};await redis.set(key("sync",peer),record);await redis.sadd(key("synced_chats"),String(peer));return record}
-async function handle(m:any){if(!m||typeof m!=="object")return;const peer=Number(m.peer_id??0),user=Number(m.from_id??m.user_id??0);console.log(`[MESSAGE RAW] peer_id=${m.peer_id??"missing"} from_id=${m.from_id??"missing"} cmid=${m.conversation_message_id??"missing"} text=${JSON.stringify(m.text??"")}`);if(!isChatPeer(peer)||user<=0)return;const text=String(m.text??"").trim();if(!text.startsWith("/"))return;const [raw,...args]=text.split(/\s+/),cmd=raw.toLowerCase();console.log(`[COMMAND] peer=${peer} user=${user} cmd=${cmd}`);
+async function handle(m:any){if(!m||typeof m!=="object")return;const peer=Number(m.peer_id??0),user=Number(m.from_id??m.user_id??0),text=String(m.text??"").trim();console.log(`[MESSAGE RAW] peer_id=${m.peer_id??"missing"} from_id=${m.from_id??"missing"} cmid=${m.conversation_message_id??"missing"} text=${JSON.stringify(text)}`);if(user<=0)return;
+const [raw,...args]=text.split(/\s+/),cmd=raw.toLowerCase();
+// /resetdata is the only command allowed in private messages, and only for a developer.
+if(!isChatPeer(peer)){
+  if(cmd!=="/resetdata")return;
+  if(!DEV.has(user))return;
+  if(args.length>0)return reply(peer,m,"Использование: /resetdata");
+  console.warn(`[RESETDATA] developer=${user} requested full Redis reset from private message`);
+  await redis.flushdb();
+  return reply(peer,m,"Все данные бота полностью сброшены. База данных очищена.");
+}
+if(cmd==="/resetdata")return;
 if(cmd==="/sync"){if(!await can(peer,user,"deputy_spec_admin"))return reply(peer,m,"Недостаточно прав.");await syncChat(peer,user);return reply(peer,m,"Синхронизация с базой данных прошла успешно!")}
 if(cmd==="/delsync"){if(!await can(peer,user,"deputy_spec_admin"))return reply(peer,m,"Недостаточно прав.");await redis.del(key("sync",peer));await redis.srem(key("synced_chats"),String(peer));return reply(peer,m,"Синхронизация с базой данных удалена.")}
 if(cmd==="/synclist"){if(!await can(peer,user,"deputy_spec_admin"))return reply(peer,m,"Недостаточно прав.");const ids=await redis.smembers(key("synced_chats"));const lines=["Список синхронизированных чатов:",""];for(const id of ids??[]){const r=await redis.get<any>(key("sync",id));lines.push(`"${r?.chatName??id}" | ${r?.ownerId?await nameLinkOf(Number(r.ownerId)):"неизвестно"} | ${id}`)}return reply(peer,m,lines.join("\n"))}
