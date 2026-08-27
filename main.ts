@@ -15,7 +15,8 @@ async function can(peer: number, user: number, min: AnyRole) {
   return hasAtLeastRole(peer, user, await getChatServer(peer), min);
 }
 async function reply(peer: number, m: any, text: string, keyboard?: any) {
-  const cmid = Number(m.conversation_message_id ?? 0) || undefined;
+  const cmid = Number(m?.conversation_message_id ?? 0) || undefined;
+  console.log(`[REPLY] peer=${peer} cmid=${cmid ?? "none"} text=${JSON.stringify(text)}`);
   return sendMessageAndGetIds(peer, text, { replyTo: cmid, keyboard });
 }
 async function synced(peer: number) { return (await redis.exists(key("sync", peer))) === 1; }
@@ -38,17 +39,24 @@ async function syncChat(peer: number, by: number) {
 }
 
 async function handle(m: any) {
-  const peer = Number(m?.peer_id ?? 0);
-  const user = Number(m?.from_id ?? 0);
-  if (!isChatPeer(peer) || user <= 0) return; // ЛС полностью игнорируются.
+  if (!m || typeof m !== "object") {
+    console.log(`[MESSAGE] invalid message object: ${typeof m}`);
+    return;
+  }
+  const peer = Number(m.peer_id ?? 0);
+  const user = Number(m.from_id ?? m.user_id ?? 0);
+  console.log(`[MESSAGE RAW] peer_id=${m.peer_id ?? "missing"} from_id=${m.from_id ?? "missing"} conversation_message_id=${m.conversation_message_id ?? "missing"} text=${JSON.stringify(m.text ?? "")}`);
+  if (!isChatPeer(peer) || user <= 0) {
+    console.log(`[MESSAGE IGNORE] peer=${peer} user=${user} reason=not_chat_or_invalid_user`);
+    return; // ЛС полностью игнорируются.
+  }
 
-  const text = String(m?.text ?? "").trim();
+  const text = String(m.text ?? "").trim();
   if (!text.startsWith("/")) return;
   const [raw, ...args] = text.split(/\s+/);
   const cmd = raw.toLowerCase();
-  console.log(`[MESSAGE] peer=${peer} user=${user} cmid=${m.conversation_message_id ?? "-"} cmd=${cmd}`);
+  console.log(`[COMMAND] peer=${peer} user=${user} cmd=${cmd} args=${JSON.stringify(args)}`);
 
-  // Эти команды доступны до полной настройки.
   if (cmd === "/sync") {
     if (!await can(peer, user, "deputy_spec_admin")) return reply(peer, m, "Недостаточно прав.");
     await syncChat(peer, user);
@@ -108,8 +116,10 @@ async function handle(m: any) {
     return reply(peer, m, lines.join("\n").trim() || "Серверов нет.");
   }
 
-  // После sync + server обычные команды начинают работать.
-  if (!await configured(peer)) return;
+  if (!await configured(peer)) {
+    console.log(`[COMMAND IGNORE] peer=${peer} cmd=${cmd} reason=chat_not_configured`);
+    return;
+  }
 
   if (cmd === "/info") {
     const r = await role(peer, user);
@@ -128,17 +138,15 @@ async function handle(m: any) {
     return reply(peer, m, "Список доступных вам команд:\n\n" + all.join("\n"));
   }
   if (cmd === "/stats") {
-    const target = user;
-    const info = await getUsersInfo([target]);
-    const u = info.get(target);
-    const r = await role(peer, target);
-    const count = Number(await redis.get(key("messages", peer, target)) ?? 0);
-    const last = Number(await redis.get(key("last", peer, target)) ?? 0);
+    const info = await getUsersInfo([user]);
+    const u = info?.get?.(user) ?? info?.[0];
+    const r = await role(peer, user);
+    const count = Number(await redis.get(key("messages", peer, user)) ?? 0);
+    const last = Number(await redis.get(key("last", peer, user)) ?? 0);
     const lastText = last ? new Intl.DateTimeFormat("ru-RU", { timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "medium" }).format(new Date(last)) + " МСК (UTC+3)" : "Нет";
-    return reply(peer, m, `Информация о пользователе ${u ? `[id${target}|${u.first_name} ${u.last_name}]` : `[id${target}|id${target}]`}\nРоль: ${ROLE_LABEL[r.role]}\nНик: ${await redis.get<string>(key("nick", peer, target)) ?? "Нет"}\nВсего сообщений: ${count}\nПоследнее сообщение: ${lastText}`);
+    return reply(peer, m, `Информация о пользователе ${u ? `[id${user}|${u.first_name} ${u.last_name}]` : `[id${user}|id${user}]`}\nРоль: ${ROLE_LABEL[r.role]}\nНик: ${await redis.get<string>(key("nick", peer, user)) ?? "Нет"}\nВсего сообщений: ${count}\nПоследнее сообщение: ${lastText}`);
   }
 
-  // Считаем сообщения только в настроенной беседе.
   await redis.incr(key("messages", peer, user));
   await redis.set(key("last", peer, user), String(Date.now()));
 }
@@ -151,8 +159,15 @@ Deno.serve(async (req) => {
     if (body?.type === "confirmation") return new Response(Deno.env.get("VK_CONFIRMATION") ?? "");
     const secret = Deno.env.get("VK_SECRET");
     if (secret && body?.secret !== secret) return new Response("bad", { status: 403 });
+
     if (body?.type === "message_new") {
-      const message = body?.object?.message ?? body?.object;
+      let object = body?.object;
+      if (typeof object === "string") {
+        try { object = JSON.parse(object); } catch { console.error("[WEBHOOK] object is invalid JSON string"); }
+      }
+      console.log(`[WEBHOOK] object_type=${typeof object} object_keys=${object && typeof object === "object" ? Object.keys(object).join(",") : "none"}`);
+      const message = object?.message ?? object?.object?.message ?? object?.object ?? object;
+      console.log(`[WEBHOOK] message_found=${!!message} message_type=${typeof message}`);
       if (message) await handle(message);
     }
     return new Response("ok");
