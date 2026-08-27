@@ -8,8 +8,9 @@ export type BanEventType = "ban" | "unban" | "sban" | "sunban" | "gban" | "gunba
 export interface BanRecord {
   reason: string;
   byUserId: number;
+  byWeight: number; // ранг выдавшего НА МОМЕНТ выдачи — снять может только тот, у кого выше
   at: number;
-  chatLabel?: string; // название чата/сервера, где выдан бан — для отображения в /getban
+  label?: string; // название чата/сервера, где выдан бан — для отображения
 }
 
 export interface BanHistoryEntry extends BanRecord {
@@ -27,7 +28,8 @@ export async function logBanEvent(userId: number, entry: BanHistoryEntry): Promi
 
 export async function getBanHistory(userId: number): Promise<BanHistoryEntry[]> {
   const raw = await redis.lrange<string>(historyKey(userId), 0, -1);
-  return (raw ?? []).map((r) => (typeof r === "string" ? JSON.parse(r) : r) as BanHistoryEntry);
+  const list = (raw ?? []).map((r) => (typeof r === "string" ? JSON.parse(r) : r) as BanHistoryEntry);
+  return list.reverse(); // самые новые сверху
 }
 
 // --- Бан в одной беседе (/ban, /unban) ---
@@ -49,7 +51,6 @@ export async function getChatBan(peerId: number, userId: number): Promise<BanRec
 }
 
 // --- Бан во всех беседах СЕРВЕРА (/sban, /sunban) ---
-// Привязка чата к серверу задаётся командой /server (см. servers.ts).
 
 function serverBanKey(serverNameLower: string, userId: number): string {
   return `b2:sban:${serverNameLower}:${userId}`;
@@ -81,7 +82,7 @@ export async function getAllServerBans(userId: number): Promise<{ serverName: st
   return result;
 }
 
-// --- Глобальный бан (/gban, /gunban) — во всех серверах и чатах ---
+// --- Глобальный бан (/gban, /gunban) — во всех беседах проекта ---
 
 function globalBanKey(userId: number): string {
   return `b2:gban:${userId}`;
@@ -115,36 +116,46 @@ export async function getActiveBanForChat(peerId: number, userId: number): Promi
   return null;
 }
 
-// --- Массовые кики (/skick — по серверу, /gkick — везде) ---
+// --- Массовые кики ---
 
 export async function kickFromServerChats(serverName: string, userId: number): Promise<number> {
   const chats = await getServerChats(serverName);
-  for (const peerId of chats) {
-    await kickFromChat(peerId, userId).catch(() => {});
-  }
+  for (const peerId of chats) await kickFromChat(peerId, userId).catch(() => {});
   return chats.length;
 }
 
 export async function kickFromAllSyncedChats(userId: number): Promise<number> {
   const peerIds = await redis.smembers("b2:synced_chats");
-  for (const peerIdStr of peerIds ?? []) {
-    await kickFromChat(Number(peerIdStr), userId).catch(() => {});
-  }
+  for (const peerIdStr of peerIds ?? []) await kickFromChat(Number(peerIdStr), userId).catch(() => {});
   return (peerIds ?? []).length;
 }
 
-// --- Мут (в рамках одной беседы) ---
+// --- Мут (в рамках одной беседы), с данными для кнопок "снять"/"очистить" ---
+
+export interface MuteRecord {
+  reason: string;
+  byUserId: number;
+  expiresAt: number;
+  botCmid?: number; // сообщение бота о муте — для кнопок и последующей очистки
+  moderatorCmid?: number; // сообщение с командой /mute — удаляется при "очистить"
+  targetCmid?: number; // сообщение нарушителя, на которое ответили — удаляется при "очистить"
+}
 
 function muteKey(peerId: number, userId: number): string {
   return `b2:mute:${peerId}:${userId}`;
 }
 
-export async function setMute(peerId: number, userId: number, minutes: number): Promise<void> {
-  await redis.set(muteKey(peerId, userId), "1", { ex: Math.max(1, minutes) * 60 });
+export async function setMute(peerId: number, userId: number, record: MuteRecord): Promise<void> {
+  const ttlSec = Math.max(1, Math.ceil((record.expiresAt - Date.now()) / 1000));
+  await redis.set(muteKey(peerId, userId), record, { ex: ttlSec });
 }
 
 export async function clearMute(peerId: number, userId: number): Promise<void> {
   await redis.del(muteKey(peerId, userId));
+}
+
+export async function getMute(peerId: number, userId: number): Promise<MuteRecord | null> {
+  return (await redis.get<MuteRecord>(muteKey(peerId, userId))) ?? null;
 }
 
 export async function isMuted(peerId: number, userId: number): Promise<boolean> {
@@ -184,9 +195,8 @@ export async function trackFloodAndShouldKick(peerId: number, userId: number, te
     ? (typeof raw === "string" ? JSON.parse(raw) : raw)
     : { lastText: "", count: 0 };
 
-  if (text === state.lastText) {
-    state.count++;
-  } else {
+  if (text === state.lastText) state.count++;
+  else {
     state.lastText = text;
     state.count = 1;
   }
@@ -195,7 +205,6 @@ export async function trackFloodAndShouldKick(peerId: number, userId: number, te
     await redis.del(floodKey(peerId, userId));
     return true;
   }
-
   await redis.set(floodKey(peerId, userId), state, { ex: 300 });
   return false;
 }
