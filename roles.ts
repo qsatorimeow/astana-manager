@@ -169,3 +169,13 @@ export async function resolveUserRole(
 
   return { role: "user", weight: ROLE_WEIGHT.user };
 }
+
+export async function hasAtLeastRole(
+  peerId: number,
+  userId: number,
+  chatServerName: string | null,
+  minRole: AnyRole,
+): Promise<boolean> {
+  const { weight } = await resolveUserRole(peerId, userId, chatServerName);
+  return weight >= ROLE_WEIGHT[minRole];
+}
