@@ -1,116 +1,23 @@
-// Вспомогательные функции для работы с VK API.
-
-const VK_TOKEN = Deno.env.get("VK_TOKEN") ?? "";
-const VK_API_VERSION = "5.199";
-
-export async function callVkApi(method: string, params: Record<string, string>): Promise<any> {
-  const body = new URLSearchParams({ ...params, access_token: VK_TOKEN, v: VK_API_VERSION });
-  const res = await fetch(`https://api.vk.com/method/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-  const data = await res.json();
-  if (data.error) console.error(`[VK API] Ошибка в методе ${method}:`, data.error);
-  return data;
+const VK_TOKEN=Deno.env.get("VK_TOKEN")??"";
+const VK_API_VERSION="5.199";
+export async function callVkApi(method:string,params:Record<string,string>={}):Promise<any>{
+  const body=new URLSearchParams({...params,access_token:VK_TOKEN,v:VK_API_VERSION});
+  try{const res=await fetch(`https://api.vk.com/method/${method}`,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body.toString()});const data=await res.json();if(data.error)console.error(`[VK API] ${method}:`,JSON.stringify(data.error));return data}catch(e){console.error(`[VK HTTP] ${method}:`,e);return{error:{error_msg:String(e)}}}
 }
-
-export interface VkUserInfo { id: number; first_name: string; last_name: string; }
-
-export async function getUsersInfo(userIds: number[]): Promise<Map<number, VkUserInfo>> {
-  const map = new Map<number, VkUserInfo>();
-  const ids = [...new Set(userIds.filter((id) => id > 0))];
-  if (!ids.length) return map;
-  const data = await callVkApi("users.get", { user_ids: ids.join(",") });
-  for (const user of data.response ?? []) map.set(user.id, { id: user.id, first_name: user.first_name, last_name: user.last_name });
-  return map;
-}
-
-export function profileLink(userId: number, name: string): string { return `[id${userId}|${name}]`; }
-
-export async function nameLinkOf(userId: number): Promise<string> {
-  const info = (await getUsersInfo([userId])).get(userId);
-  return profileLink(userId, info ? `${info.first_name} ${info.last_name}` : `id${userId}`);
-}
-
-export interface ConversationMember { memberId: number; isOwner: boolean; isAdmin: boolean; }
-
-export async function getConversationMembers(peerId: number): Promise<ConversationMember[]> {
-  const data = await callVkApi("messages.getConversationMembers", { peer_id: String(peerId) });
-  return (data.response?.items ?? []).map((x: any) => ({ memberId: Number(x.member_id), isOwner: !!x.is_owner, isAdmin: !!x.is_admin }));
-}
-
-export function isChatPeer(peerId: number): boolean { return peerId >= 2_000_000_000; }
-export function toChatId(peerId: number): number { return peerId - 2_000_000_000; }
-
-export async function kickFromChat(peerId: number, userId: number): Promise<void> {
-  await callVkApi("messages.removeChatUser", { chat_id: String(toChatId(peerId)), member_id: String(userId) });
-}
-
-export async function resolveScreenName(screenName: string): Promise<number | null> {
-  const data = await callVkApi("utils.resolveScreenName", { screen_name: screenName });
-  return data?.response?.type === "user" ? Number(data.response.object_id) : null;
-}
-
-export async function resolveTargetUserId(raw: string): Promise<number | null> {
-  let text = raw.trim();
-  if (!text) return null;
-  const mention = text.match(/\[id(\d+)\|/);
-  if (mention) return Number(mention[1]);
-  text = text.replace(/^https?:\/\/(www\.)?(vk\.com|vk\.ru)\//i, "").replace(/^@/, "").trim();
-  const id = text.match(/^id(\d+)$/i);
-  if (id) return Number(id[1]);
-  if (/^\d+$/.test(text)) return Number(text);
-  return await resolveScreenName(text);
-}
-
-export interface SentMessageIds { messageId?: number; conversationMessageId?: number; }
-
-export async function sendMessageAndGetIds(
-  peerId: number,
-  text: string,
-  options?: { keyboard?: string; replyToConversationMessageId?: number },
-): Promise<SentMessageIds> {
-  const params: Record<string, string> = {
-    peer_id: String(peerId),
-    message: text,
-    random_id: String(Math.floor(Math.random() * 2_000_000_000) - 1_000_000_000),
-  };
-  if (options?.keyboard) params.keyboard = options.keyboard;
-  if (options?.replyToConversationMessageId) {
-    params.forward = JSON.stringify({
-      peer_id: peerId,
-      conversation_message_ids: [options.replyToConversationMessageId],
-      is_reply: true,
-    });
-  }
-
-  const sent = await callVkApi("messages.send", params);
-  const directMessageId = Number(sent?.response ?? 0);
-
-  if (directMessageId > 0) {
-    const byId = await callVkApi("messages.getById", { message_ids: String(directMessageId) });
-    const item = byId?.response?.items?.[0];
-    if (item) {
-      return {
-        messageId: directMessageId,
-        conversationMessageId: Number(item.conversation_message_id) || undefined,
-      };
-    }
-    return { messageId: directMessageId };
-  }
-
-  // В некоторых конфигурациях VK возвращает response: 0 даже при успешной отправке.
-  // В таком случае ищем последнее исходящее сообщение с тем же текстом.
-  const history = await callVkApi("messages.getHistory", { peer_id: String(peerId), count: "20" });
-  const item = (history?.response?.items ?? []).find((x: any) => x.out === 1 && String(x.text ?? "") === text);
-  if (item) {
-    return {
-      messageId: Number(item.id) || undefined,
-      conversationMessageId: Number(item.conversation_message_id) || undefined,
-    };
-  }
-
-  console.error(`[VK] Не удалось получить ID отправленного сообщения peer=${peerId}`);
-  return {};
-}
+export interface VkUserInfo{id:number;first_name:string;last_name:string}
+export async function getUsersInfo(ids:number[]):Promise<Map<number,VkUserInfo>>{const out=new Map<number,VkUserInfo>();const x=[...new Set(ids.filter(id=>id>0))];if(!x.length)return out;const d=await callVkApi("users.get",{user_ids:x.join(",")});for(const u of d?.response??[])out.set(u.id,{id:u.id,first_name:u.first_name,last_name:u.last_name});return out}
+export function profileLink(id:number,name:string){return`[id${id}|${name}]`}
+export async function nameLinkOf(id:number){const m=await getUsersInfo([id]);const u=m.get(id);return profileLink(id,u?`${u.first_name} ${u.last_name}`:`id${id}`)}
+export const nameLinkOfAny=nameLinkOf;
+export interface ConversationMember{memberId:number;isOwner:boolean;isAdmin:boolean}
+export async function getConversationMembers(peerId:number):Promise<ConversationMember[]>{const d=await callVkApi("messages.getConversationMembers",{peer_id:String(peerId)});return(d?.response?.items??[]).map((x:any)=>({memberId:Number(x.member_id),isOwner:!!x.is_owner,isAdmin:!!x.is_admin}))}
+export const getMembers=getConversationMembers;
+export function isChatPeer(peerId:number){return peerId>=2000000000}
+export const isChat=isChatPeer;
+export function toChatId(peerId:number){return peerId-2000000000}
+export async function kickFromChat(peerId:number,userId:number){return callVkApi("messages.removeChatUser",{chat_id:String(toChatId(peerId)),member_id:String(userId)})}
+export async function resolveScreenName(name:string):Promise<number|null>{const d=await callVkApi("utils.resolveScreenName",{screen_name:name});return d?.response?.type==="user"?Number(d.response.object_id):null}
+export async function resolveTargetUserId(raw:string):Promise<number|null>{let s=raw.trim();if(!s)return null;let m=s.match(/\[id(\d+)\|/);if(m)return+m[1];s=s.replace(/^https?:\/\/(www\.)?(vk\.com|vk\.ru)\//i,"").replace(/^@/,"");m=s.match(/^id(\d+)$/i);if(m)return+m[1];if(/^\d+$/.test(s))return+s;return resolveScreenName(s)}
+export interface SentMessageIds{messageId?:number;conversationMessageId?:number}
+export async function sendMessageAndGetIds(peerId:number,text:string,options?:{keyboard?:string;replyToConversationMessageId?:number}):Promise<SentMessageIds>{const p:Record<string,string>={peer_id:String(peerId),message:text,random_id:String(Math.floor(Math.random()*2147483647))};if(options?.keyboard)p.keyboard=options.keyboard;if(options?.replyToConversationMessageId)p.forward=JSON.stringify({peer_id:peerId,conversation_message_ids:[options.replyToConversationMessageId],is_reply:true});const d=await callVkApi("messages.send",p);const id=Number(d?.response??0);if(id>0)return{messageId:id};return{}}
+export async function deleteMessages(peerId:number,messageIds:number[]){if(!messageIds.length)return;await callVkApi("messages.delete",{message_ids:messageIds.join(","),delete_for_all:"1"})}
