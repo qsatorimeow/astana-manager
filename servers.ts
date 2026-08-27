@@ -62,21 +62,3 @@ export async function getServerChats(name: string): Promise<number[]> {
   const members = await redis.smembers(serverChatsKey(name.toLowerCase()));
   return (members ?? []).map(Number);
 }
-
-export async function buildServersListMessage(): Promise<string> {
-  const names = await listServers();
-  if (names.length === 0) return "Список серверов проекта пуст.";
-
-  const lines = ["Список всех серверов проекта:"];
-  for (const name of names) {
-    lines.push("");
-    lines.push(name);
-    const chats = await getServerChats(name);
-    if (chats.length === 0) {
-      lines.push("(нет привязанных бесед)");
-    } else {
-      for (const peerId of chats) lines.push(`Беседа | ${peerId}`);
-    }
-  }
-  return lines.join("\n");
-}
