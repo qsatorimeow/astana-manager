@@ -1,14 +1,19 @@
 // Роли и права доступа. Хранилище — Upstash Redis (Sets).
+// Три уровня охвата: глобальный (весь проект), серверный (все беседы сервера),
+// по беседе (только эта беседа).
 import { redis } from "./kv.ts";
 
 export type GlobalRole = "spec_admin" | "deputy_spec_admin";
+export type ServerRole = "main_admin" | "deputy_main_admin";
 export type ChatRole = "senior_admin" | "admin" | "senior_moderator" | "moderator";
-export type AnyRole = "developer" | GlobalRole | ChatRole | "user";
+export type AnyRole = "developer" | GlobalRole | ServerRole | ChatRole | "user";
 
 export const ROLE_WEIGHT: Record<AnyRole, number> = {
   developer: 100,
-  spec_admin: 90,
-  deputy_spec_admin: 80,
+  spec_admin: 95,
+  deputy_spec_admin: 90,
+  main_admin: 85,
+  deputy_main_admin: 80,
   senior_admin: 70,
   admin: 60,
   senior_moderator: 50,
@@ -20,6 +25,8 @@ export const ROLE_LABEL: Record<AnyRole, string> = {
   developer: "Разработчик",
   spec_admin: "Спец. администратор",
   deputy_spec_admin: "Зам. спец. администратора",
+  main_admin: "Главный администратор",
+  deputy_main_admin: "Зам. главного администратора",
   senior_admin: "Старший администратор",
   admin: "Администратор",
   senior_moderator: "Старший модератор",
@@ -32,6 +39,8 @@ export const ROLE_GENITIVE: Record<AnyRole, string> = {
   developer: "разработчика",
   spec_admin: "спец. администратора",
   deputy_spec_admin: "зам. спец. администратора",
+  main_admin: "главного администратора",
+  deputy_main_admin: "зам. главного администратора",
   senior_admin: "старшего администратора",
   admin: "администратора",
   senior_moderator: "старшего модератора",
@@ -40,6 +49,7 @@ export const ROLE_GENITIVE: Record<AnyRole, string> = {
 };
 
 const CHAT_ROLES: ChatRole[] = ["senior_admin", "admin", "senior_moderator", "moderator"];
+const SERVER_ROLES: ServerRole[] = ["main_admin", "deputy_main_admin"];
 
 function developerIds(): number[] {
   return (Deno.env.get("DEVELOPER_IDS") ?? "")
@@ -52,6 +62,8 @@ function developerIds(): number[] {
 export function isDeveloperId(userId: number): boolean {
   return developerIds().includes(userId);
 }
+
+// --- Глобальные роли ---
 
 function globalRoleKey(role: GlobalRole): string {
   return `b2:role:global:${role}`;
@@ -80,6 +92,36 @@ export async function getUserGlobalRole(userId: number): Promise<GlobalRole | nu
   return null;
 }
 
+// --- Серверные роли (Главный администратор / Зам. главного администратора) ---
+
+function serverRoleKey(serverNameLower: string, role: ServerRole): string {
+  return `b2:role:server:${serverNameLower}:${role}`;
+}
+
+export async function addServerRole(serverName: string, role: ServerRole, userId: number): Promise<void> {
+  await redis.sadd(serverRoleKey(serverName.toLowerCase(), role), String(userId));
+}
+
+export async function removeServerRole(serverName: string, role: ServerRole, userId: number): Promise<void> {
+  await redis.srem(serverRoleKey(serverName.toLowerCase(), role), String(userId));
+}
+
+export async function getServerRoleMembers(serverName: string, role: ServerRole): Promise<number[]> {
+  const members = await redis.smembers(serverRoleKey(serverName.toLowerCase(), role));
+  return (members ?? []).map(Number);
+}
+
+export async function getUserServerRole(serverName: string, userId: number): Promise<ServerRole | null> {
+  for (const role of SERVER_ROLES) {
+    if (await redis.sismember(serverRoleKey(serverName.toLowerCase(), role), String(userId))) return role;
+  }
+  return null;
+}
+
+export { SERVER_ROLES };
+
+// --- Роли в рамках конкретной беседы ---
+
 function chatRoleKey(peerId: number, role: ChatRole): string {
   return `b2:role:chat:${peerId}:${role}`;
 }
@@ -106,20 +148,24 @@ export async function getUserChatRole(peerId: number, userId: number): Promise<C
 
 export { CHAT_ROLES };
 
-/** Итоговая роль и её "вес" — вес выше = прав больше. */
-export async function resolveUserRole(peerId: number, userId: number): Promise<{ role: AnyRole; weight: number }> {
+/** Итоговая роль пользователя в конкретной беседе (с учётом сервера, к которому она привязана). */
+export async function resolveUserRole(
+  peerId: number,
+  userId: number,
+  chatServerName: string | null,
+): Promise<{ role: AnyRole; weight: number }> {
   if (isDeveloperId(userId)) return { role: "developer", weight: ROLE_WEIGHT.developer };
 
   const globalRole = await getUserGlobalRole(userId);
   if (globalRole) return { role: globalRole, weight: ROLE_WEIGHT[globalRole] };
 
+  if (chatServerName) {
+    const serverRole = await getUserServerRole(chatServerName, userId);
+    if (serverRole) return { role: serverRole, weight: ROLE_WEIGHT[serverRole] };
+  }
+
   const chatRole = await getUserChatRole(peerId, userId);
   if (chatRole) return { role: chatRole, weight: ROLE_WEIGHT[chatRole] };
 
   return { role: "user", weight: ROLE_WEIGHT.user };
-}
-
-export async function hasAtLeastRole(peerId: number, userId: number, minRole: AnyRole): Promise<boolean> {
-  const { weight } = await resolveUserRole(peerId, userId);
-  return weight >= ROLE_WEIGHT[minRole];
 }
