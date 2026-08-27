@@ -1,24 +1,37 @@
-// Настройка чата: синхронизация, привязка к серверу старшего администратора, тип беседы.
-// Бот не выполняет обычные команды, пока все три шага не пройдены.
+// Настройка чата: синхронизация (получение/обновление данных чата) + привязка к серверу.
+// Бот не выполняет обычные команды, пока оба шага не пройдены.
 import { redis } from "./kv.ts";
-import { nameLinkOf } from "./vk.ts";
+import { callVkApi, getConversationMembers, nameLinkOfAny } from "./vk.ts";
 import { getChatServer } from "./servers.ts";
 
-export type ChatType = "admin";
-
-export const CHAT_TYPE_LABEL: Record<ChatType, string> = {
-  admin: "Административный чат",
-};
-
-// --- Синхронизация (доступно спец. и зам. спец. администратору) ---
+export interface SyncRecord {
+  chatName: string;
+  ownerId: number; // может быть отрицательным (сообщество)
+  syncedBy: number;
+  syncedAt: number;
+}
 
 function syncKey(peerId: number): string {
   return `b2:sync:${peerId}`;
 }
 
-export async function setSync(peerId: number, ownerUserId: number): Promise<void> {
-  await redis.set(syncKey(peerId), String(ownerUserId));
+/** Забирает актуальное название беседы и её владельца из VK и сохраняет/обновляет запись. */
+export async function syncChat(peerId: number, byUserId: number): Promise<{ record: SyncRecord; wasNew: boolean }> {
+  const wasNew = !(await isSynced(peerId));
+
+  const [titleData, members] = await Promise.all([
+    callVkApi("messages.getConversationsById", { peer_ids: String(peerId) }),
+    getConversationMembers(peerId),
+  ]);
+
+  const chatName = titleData?.response?.items?.[0]?.chat_settings?.title ?? `Беседа ${peerId}`;
+  const owner = members.find((m) => m.isOwner);
+  const ownerId = owner?.memberId ?? 0;
+
+  const record: SyncRecord = { chatName, ownerId, syncedBy: byUserId, syncedAt: Date.now() };
+  await redis.set(syncKey(peerId), record);
   await redis.sadd("b2:synced_chats", String(peerId));
+  return { record, wasNew };
 }
 
 export async function clearSync(peerId: number): Promise<void> {
@@ -30,9 +43,8 @@ export async function isSynced(peerId: number): Promise<boolean> {
   return (await redis.exists(syncKey(peerId))) === 1;
 }
 
-export async function getSyncOwner(peerId: number): Promise<number | null> {
-  const val = await redis.get<string | number>(syncKey(peerId));
-  return val !== null && val !== undefined ? Number(val) : null;
+export async function getSyncRecord(peerId: number): Promise<SyncRecord | null> {
+  return (await redis.get<SyncRecord>(syncKey(peerId))) ?? null;
 }
 
 export async function getSyncedChats(): Promise<number[]> {
@@ -44,87 +56,27 @@ export async function buildSyncListMessage(): Promise<string> {
   const peerIds = await getSyncedChats();
   if (peerIds.length === 0) return "Список синхронизированных чатов пуст.";
 
-  const lines = ["Список синхронизированных чатов:"];
+  const lines = ["Список синхронизированных чатов:", ""];
   for (const peerId of peerIds) {
-    const ownerId = await getSyncOwner(peerId);
-    const ownerName = ownerId ? await nameLinkOf(ownerId) : "неизвестно";
-    lines.push(`Чат ${peerId} | ${ownerName}`);
+    const record = await getSyncRecord(peerId);
+    if (!record) continue;
+    const ownerLink = record.ownerId ? await nameLinkOfAny(record.ownerId) : "неизвестно";
+    lines.push(`"${record.chatName}" | ${ownerLink} | ${peerId}`);
   }
   return lines.join("\n");
 }
 
-// --- Привязка чата к своему списку (доступно старшему администратору) ---
-
-function groupOwnerKey(peerId: number): string {
-  return `b2:group_owner:${peerId}`;
-}
-
-function ownerGroupsKey(ownerUserId: number): string {
-  return `b2:owner_groups:${ownerUserId}`;
-}
-
-export async function addGroup(peerId: number, ownerUserId: number): Promise<void> {
-  await redis.set(groupOwnerKey(peerId), String(ownerUserId));
-  await redis.sadd(ownerGroupsKey(ownerUserId), String(peerId));
-}
-
-export async function removeGroup(peerId: number, ownerUserId: number): Promise<void> {
-  await redis.del(groupOwnerKey(peerId));
-  await redis.srem(ownerGroupsKey(ownerUserId), String(peerId));
-}
-
-export async function isGroupAdded(peerId: number): Promise<boolean> {
-  return (await redis.exists(groupOwnerKey(peerId))) === 1;
-}
-
-export async function getGroupOwner(peerId: number): Promise<number | null> {
-  const val = await redis.get<string | number>(groupOwnerKey(peerId));
-  return val !== null && val !== undefined ? Number(val) : null;
-}
-
-export async function getOwnerGroups(ownerUserId: number): Promise<number[]> {
-  const members = await redis.smembers(ownerGroupsKey(ownerUserId));
-  return (members ?? []).map(Number);
-}
-
-// --- Тип беседы (доступно старшему администратору) ---
-
-function chatTypeKey(peerId: number): string {
-  return `b2:chattype:${peerId}`;
-}
-
-export async function setChatType(peerId: number, type: ChatType): Promise<void> {
-  await redis.set(chatTypeKey(peerId), type);
-}
-
-export async function getChatType(peerId: number): Promise<ChatType | null> {
-  const val = await redis.get<ChatType>(chatTypeKey(peerId));
-  return val ?? null;
-}
-
-// --- Общая проверка готовности чата к использованию бота ---
+// --- Проверка готовности чата к использованию бота: /sync + /server ---
 
 export async function isChatConfigured(peerId: number): Promise<boolean> {
-  const [synced, server, grouped, type] = await Promise.all([
-    isSynced(peerId),
-    getChatServer(peerId),
-    isGroupAdded(peerId),
-    getChatType(peerId),
-  ]);
-  return synced && server !== null && grouped && type !== null;
+  const [synced, server] = await Promise.all([isSynced(peerId), getChatServer(peerId)]);
+  return synced && server !== null;
 }
 
 export async function getConfigStatusMessage(peerId: number): Promise<string> {
-  const [synced, server, grouped, type] = await Promise.all([
-    isSynced(peerId),
-    getChatServer(peerId),
-    isGroupAdded(peerId),
-    getChatType(peerId),
-  ]);
+  const [synced, server] = await Promise.all([isSynced(peerId), getChatServer(peerId)]);
   const lines = ["Чат ещё не готов к использованию бота. Осталось:"];
   if (!synced) lines.push("— /sync (синхронизация с базой данных)");
   if (!server) lines.push("— /server название (привязать беседу к серверу проекта)");
-  if (!grouped) lines.push("— /addgroup (привязать чат к своему списку)");
-  if (!type) lines.push("— /type (выбрать тип беседы)");
   return lines.join("\n");
 }
