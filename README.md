@@ -11,3 +11,4 @@ Environment variables:
 Deploy on Deno Deploy. The bot uses VK API 5.199 and Upstash Redis.
 
 The bot has separate Redis key prefix `newbot:` so it does not share state with the previous event bot.
+by satori
