@@ -182,6 +182,7 @@ export const ALT_MAP: Record<string, string> = {
   "стата": "/stats",
   "статс": "/stats",
   "тишина": "/timeout",
-  "olist": "/onlinelist",
-  "онлайн": "/onlinelist",
+  "olist": "/olist",
+  "онлайн": "/olist",
+  "зов": "/zov",
 };
