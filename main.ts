@@ -14,7 +14,7 @@
 // Назначение ранга можно коротко (/moder, /admin, /senadmin, /zga, /zsa, /sa),
 // снятие — только полной формой (/delmoder и т.д.)
 
-import { redis } from "./kv.ts";
+import { redis, scanKeys } from "./kv.ts";
 import {
   callVkApi,
   getBotGroupId,
@@ -909,8 +909,26 @@ async function handleMessageEvent(body: any) {
   if (payload.action === "clear_mute") {
     if (!(await hasAtLeastRole(peerId, userId, serverName, "senior_moderator"))) return;
     const record = await getMute(peerId, payload.targetId);
-    const cmids = [record?.moderatorCmid, record?.targetCmid, record?.botCmid].filter(Boolean).join(",");
+    if (!record) return;
+
+    const cmids = [record.moderatorCmid, record.targetCmid].filter(Boolean).join(",");
     if (cmids) await callVkApi("messages.delete", { peer_id: String(peerId), cmids, delete_for_all: "1" });
+
+    if (record.botCmid) {
+      const text = [
+        `${await nameLinkOf(record.byUserId)} замьютил-(а) ${await nameLinkOf(payload.targetId)}`,
+        `Причина: ${record.reason}`,
+        `Мут выдан до: ${formatMsk(record.expiresAt)}`,
+      ].join("\n");
+      // Редактируем без forward/reply и без клавиатуры — сообщение становится обычным,
+      // не привязанным к удалённым сообщениям.
+      await callVkApi("messages.edit", {
+        peer_id: String(peerId),
+        conversation_message_id: String(record.botCmid),
+        message: text,
+        keyboard: JSON.stringify({ inline: true, buttons: [] }),
+      });
+    }
     return;
   }
 
@@ -941,7 +959,7 @@ async function handleMessageNew(body: any) {
     const normalized = text.replace(/^[+!]/, "/").toLowerCase();
     console.log(`[DEBUG] ЛС от ${fromId}: text="${text}" normalized="${normalized}" isDeveloper=${isDeveloperId(fromId)}`);
     if (normalized === "/resetdata" && isDeveloperId(fromId)) {
-      const keys = await redis.keys("b2:*");
+      const keys = await scanKeys("b2:*");
       console.log(`[DEBUG] /resetdata: найдено ключей ${keys.length}`);
       if (keys.length > 0) await redis.del(...keys);
       await sendMessageAndGetIds(peerId, `Удалено ключей: ${keys.length}`);
