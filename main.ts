@@ -1,4 +1,4 @@
-// Бот 2 (astana-manager) — Deno Deploy + Deno KV
+// Бот 2 (astana-manager) — Deno Deploy + Upstash Redis
 // ------------------------------------------------------
 // Три уровня ролей: глобальный (весь проект), серверный (только Главный
 // администратор — один на сервер), по беседе (всё остальное, но действие
@@ -20,6 +20,7 @@ import {
   getBotGroupId,
   getConversationMembers,
   getOnlineMembers,
+  getUsersInfo,
   isChatPeer,
   kickFromChat,
   nameLinkOf,
@@ -154,6 +155,26 @@ async function extractTarget(
   return { targetId: null, rest: args };
 }
 
+/**
+ * Для /getban и /banlist: реплай/аргумент как обычно, плюс поддержка одной
+ * пересланной пересылки. Если переслано НЕСКОЛЬКО сообщений — цель неоднозначна.
+ * В отличие от extractTarget, здесь НЕТ дефолта на себя — если ничего не
+ * указано, вызывающий должен получить "Вы не указали пользователя".
+ */
+// deno-lint-ignore no-explicit-any
+async function extractLookupTarget(
+  args: string[],
+  replyToMessage: ReplyContext | null,
+  fwdMessages: any[],
+): Promise<{ targetId: number | null; ambiguous: boolean }> {
+  if (fwdMessages && fwdMessages.length > 0) {
+    if (fwdMessages.length > 1) return { targetId: null, ambiguous: true };
+    return { targetId: fwdMessages[0].from_id, ambiguous: false };
+  }
+  const { targetId } = await extractTarget(args, replyToMessage);
+  return { targetId, ambiguous: false };
+}
+
 /** Никто не может действовать на себя. Иначе — строго выше рангом (и не на бота). */
 async function canActOn(peerId: number, actorId: number, targetId: number, serverName: string | null): Promise<boolean> {
   if (actorId === targetId) return false;
@@ -217,7 +238,7 @@ async function handleSetupCommand(
     case "/addserver": {
       if (!(await hasAtLeastRole(peerId, fromId, serverName, "spec_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return true; }
       const name = args.join(" ");
-      if (!name) { await reply(peerId, cmid, NO_TARGET); return true; }
+      if (!name) { await reply(peerId, cmid, "Вы не указали название сервера"); return true; }
       const created = await addServer(name);
       await reply(peerId, cmid, created ? `Сервер «${name}» добавлен в список серверов проекта` : "Сервер с таким названием уже существует.");
       return true;
@@ -226,7 +247,7 @@ async function handleSetupCommand(
     case "/delserver": {
       if (!(await hasAtLeastRole(peerId, fromId, serverName, "spec_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return true; }
       const name = args.join(" ");
-      if (!name) { await reply(peerId, cmid, NO_TARGET); return true; }
+      if (!name) { await reply(peerId, cmid, "Вы не указали название сервера"); return true; }
       await removeServer(name);
       await reply(peerId, cmid, `Сервер «${name}» удален из списков серверов проекта`);
       return true;
@@ -235,7 +256,7 @@ async function handleSetupCommand(
     case "/server": {
       if (!(await hasAtLeastRole(peerId, fromId, serverName, "spec_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return true; }
       const name = args.join(" ");
-      if (!name) { await reply(peerId, cmid, NO_TARGET); return true; }
+      if (!name) { await reply(peerId, cmid, "Вы не указали название сервера"); return true; }
       if (!(await serverExists(name))) { await reply(peerId, cmid, "Такого сервера не существует. Сначала /addserver."); return true; }
       await bindChatToServer(peerId, name);
       await reply(peerId, cmid, `Вы привязали данную беседу в список бесед сервера «${name}»`);
@@ -311,7 +332,8 @@ async function handleRankCommand(
 
   const { targetId } = await extractTarget(args, replyToMessage);
   if (!targetId) { await reply(peerId, cmid, NO_TARGET); return true; }
-  if (!(await canActOn(peerId, fromId, targetId, serverName))) { await reply(peerId, cmid, NO_PERMISSION); return true; }
+  const selfByDeveloper = isDeveloperId(fromId) && targetId === fromId;
+  if (!selfByDeveloper && !(await canActOn(peerId, fromId, targetId, serverName))) { await reply(peerId, cmid, NO_PERMISSION); return true; }
 
   if (cfg.scope === "server") {
     if (!serverName) { await reply(peerId, cmid, "Эта беседа не привязана к серверу."); return true; }
@@ -360,9 +382,11 @@ async function handleRankCommand(
   return true;
 }
 
-async function isChatStaff(peerId: number, userId: number, serverName: string | null): Promise<boolean> {
-  const { weight } = await resolveUserRole(peerId, userId, serverName);
-  return weight >= 40;
+/** /zov тегает всех, включая стафф, кроме спец. и зам. спец. администратора (и разработчика). */
+async function isExcludedFromZov(userId: number): Promise<boolean> {
+  if (isDeveloperId(userId)) return true;
+  const role = await getUserGlobalRole(userId);
+  return role === "spec_admin" || role === "deputy_spec_admin";
 }
 
 // ============================= Клавиатуры =============================
@@ -511,7 +535,7 @@ async function handleCommand(
       const targets: number[] = [];
       for (const m of members) {
         if (m.memberId <= 0) continue;
-        if (await isChatStaff(peerId, m.memberId, serverName)) continue;
+        if (await isExcludedFromZov(m.memberId)) continue;
         targets.push(m.memberId);
       }
       const hearts = targets.map((id) => `[id${id}|🖤]`).join("");
@@ -616,8 +640,9 @@ async function handleCommand(
 
     case "/getban": {
       if (!(await hasAtLeastRole(peerId, fromId, serverName, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
-      const { targetId } = await extractTarget(args, replyToMessage);
-      const userId = targetId ?? fromId;
+      const { targetId, ambiguous } = await extractLookupTarget(args, replyToMessage, rawMessage.fwd_messages ?? []);
+      if (ambiguous || !targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      const userId = targetId;
       const [globalBan, serverBans, chatBan, name] = await Promise.all([
         getGlobalBan(userId),
         getAllServerBans(userId),
@@ -646,8 +671,9 @@ async function handleCommand(
 
     case "/banlist": {
       if (!(await hasAtLeastRole(peerId, fromId, serverName, "senior_admin"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
-      const { targetId } = await extractTarget(args, replyToMessage);
-      const userId = targetId ?? fromId;
+      const { targetId, ambiguous } = await extractLookupTarget(args, replyToMessage, rawMessage.fwd_messages ?? []);
+      if (ambiguous || !targetId) { await reply(peerId, cmid, NO_TARGET); return; }
+      const userId = targetId;
       const [history, name] = await Promise.all([getBanHistory(userId), nameLinkOf(userId)]);
       if (history.length === 0) { await reply(peerId, cmid, `Список блокировок пользователя ${name}:\n\nИстория пуста.`); return; }
       const lines = [`Список блокировок пользователя ${name}:`, ""];
@@ -663,12 +689,13 @@ async function handleCommand(
 
     case "/kick": {
       if (!(await hasAtLeastRole(peerId, fromId, serverName, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
-      const { targetId } = await extractTarget(args, replyToMessage);
+      const { targetId, rest } = await extractTarget(args, replyToMessage);
       if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
       if (!(await canActOn(peerId, fromId, targetId, serverName))) { await reply(peerId, cmid, NO_PERMISSION); return; }
-      await logBanEvent(targetId, { type: "kick", peerId, reason: "Не указана", byUserId: fromId, byWeight: 0, at: Date.now() });
+      const reason = rest.join(" ") || "Не указана";
+      await logBanEvent(targetId, { type: "kick", peerId, reason, byUserId: fromId, byWeight: 0, at: Date.now() });
       await kickAndPurge(peerId, targetId);
-      await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из этой беседы ${await nameLinkOf(targetId)}`);
+      await reply(peerId, cmid, `${await nameLinkOf(fromId)} исключил-(а) из этой беседы ${await nameLinkOf(targetId)}\nПричина: ${reason}`);
       break;
     }
 
@@ -788,7 +815,7 @@ async function handleCommand(
       if (!targetId) { await reply(peerId, cmid, NO_TARGET); return; }
       if (!(await canActOn(peerId, fromId, targetId, serverName))) { await reply(peerId, cmid, "Вы не можете менять ник данному пользователю!"); return; }
       const nick = rest.join(" ");
-      if (!nick) { await reply(peerId, cmid, "Укажите ник."); return; }
+      if (!nick) { await reply(peerId, cmid, "Вы не указали ник"); return; }
       await setNickFor(peerId, targetId, nick);
       await reply(peerId, cmid, `${await nameLinkOf(fromId)} сменил-(а) ник у ${await nameLinkOf(targetId)}\nНовый ник: ${nick}`);
       break;
@@ -818,7 +845,7 @@ async function handleCommand(
     case "/getacc": {
       if (!(await hasAtLeastRole(peerId, fromId, serverName, "moderator"))) { await reply(peerId, cmid, NO_PERMISSION); return; }
       const nick = args.join(" ");
-      if (!nick) { await reply(peerId, cmid, "Укажите ник."); return; }
+      if (!nick) { await reply(peerId, cmid, "Вы не указали ник"); return; }
       const userId = await findUserIdByNick(peerId, nick);
       await reply(peerId, cmid, userId ? `Ник ${nick} принадлежит — ${await nameLinkOf(userId)}` : "Ник не найден.");
       break;
@@ -912,8 +939,10 @@ async function handleMessageNew(body: any) {
 
   if (!isChatPeer(peerId)) {
     const normalized = text.replace(/^[+!]/, "/").toLowerCase();
+    console.log(`[DEBUG] ЛС от ${fromId}: text="${text}" normalized="${normalized}" isDeveloper=${isDeveloperId(fromId)}`);
     if (normalized === "/resetdata" && isDeveloperId(fromId)) {
       const keys = await redis.keys("b2:*");
+      console.log(`[DEBUG] /resetdata: найдено ключей ${keys.length}`);
       if (keys.length > 0) await redis.del(...keys);
       await sendMessageAndGetIds(peerId, `Удалено ключей: ${keys.length}`);
     }
@@ -1010,10 +1039,13 @@ async function handleChatInviteUser(body: any) {
 
   if (!(await isChatConfigured(peerId))) return;
 
+  const infoMap = await getUsersInfo([userId]);
+  const firstName = infoMap.get(userId)?.first_name ?? `id${userId}`;
+
   await sendMessageAndGetIds(
     peerId,
     [
-      `${await nameLinkOf(userId)}, добро пожаловать в беседу!`,
+      `@id${userId} (${firstName}), добро пожаловать в беседу!`,
       "Не забудь прочитать закреплённое сообщение!",
       'Посмотреть ссылки на официальные ресурсы проекта: «/info»',
     ].join("\n"),
